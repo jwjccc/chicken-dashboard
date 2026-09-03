@@ -73,7 +73,7 @@ A lightweight self-hosted server status monitor inspired by the DStatus demo, tr
 Quick install on a new server after publishing this project to GitHub:
 
 ```bash
-curl -L https://raw.githubusercontent.com/jwjccc/xiaoji-dashboard/main/scripts/install-panel.sh -o install-panel.sh && chmod +x install-panel.sh && env PROBE_REPO_URL=https://github.com/jwjccc/xiaoji-dashboard.git PROBE_REF=main PROBE_PORT=8080 ./install-panel.sh
+curl -L https://raw.githubusercontent.com/jwjccc/chicken-dashboard/main/scripts/install-panel.sh -o install-panel.sh && chmod +x install-panel.sh && env PROBE_REPO_URL=https://github.com/jwjccc/chicken-dashboard.git PROBE_REF=main PROBE_PORT=8080 ./install-panel.sh
 ```
 
 卸载面板并删除面板配置、运行状态和监控数据（不会删除 Agent）：

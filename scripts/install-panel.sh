@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_URL="${PROBE_REPO_URL:-https://github.com/jwjccc/xiaoji-dashboard.git}"
+REPO_URL="${PROBE_REPO_URL:-https://github.com/jwjccc/chicken-dashboard.git}"
 REF="${PROBE_REF:-main}"
 INSTALL_DIR="${PROBE_PANEL_DIR:-/opt/server-probe-monitor}"
 SERVICE_NAME="${PROBE_PANEL_SERVICE:-server-probe-monitor}"
