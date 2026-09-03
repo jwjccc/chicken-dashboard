@@ -73,13 +73,13 @@ A lightweight self-hosted server status monitor inspired by the DStatus demo, tr
 Quick install on a new server after publishing this project to GitHub:
 
 ```bash
-curl -L https://raw.githubusercontent.com/jwjccc/chicken-dashboard/main/scripts/install-panel.sh -o install-panel.sh && chmod +x install-panel.sh && env PROBE_REPO_URL=https://github.com/jwjccc/chicken-dashboard.git PROBE_REF=main PROBE_PORT=8080 ./install-panel.sh
+curl -L https://raw.githubusercontent.com/jwjccc/xiaoji-dashboard/main/scripts/install-panel.sh -o install-panel.sh && chmod +x install-panel.sh && env PROBE_REPO_URL=https://github.com/jwjccc/xiaoji-dashboard.git PROBE_REF=main PROBE_PORT=8080 ./install-panel.sh
 ```
 
 卸载面板并删除面板配置、运行状态和监控数据（不会删除 Agent）：
 
 ```bash
-sudo bash -c 'read -r -p "是否卸载面板并删除全部数据？[Y/N] " a; [[ "$a" =~ ^[Yy]$ ]] || exit 0; systemctl disable --now server-probe-monitor.service 2>/dev/null || true; rm -f /etc/systemd/system/server-probe-monitor.service; systemctl daemon-reload; rm -rf -- /opt/server-probe-monitor'
+curl -fsSL https://raw.githubusercontent.com/jwjccc/chicken-dashboard/main/scripts/uninstall-panel.sh -o uninstall-panel.sh && chmod +x uninstall-panel.sh && sudo ./uninstall-panel.sh
 ```
 
 This installs the hub panel as a systemd service. It does not bind other servers as agents; use the admin backend to generate per-server agent install commands after the panel is online.
