@@ -76,6 +76,12 @@ Quick install on a new server after publishing this project to GitHub:
 curl -L https://raw.githubusercontent.com/jwjccc/xiaoji-dashboard/main/scripts/install-panel.sh -o install-panel.sh && chmod +x install-panel.sh && env PROBE_REPO_URL=https://github.com/jwjccc/xiaoji-dashboard.git PROBE_REF=main PROBE_PORT=8080 ./install-panel.sh
 ```
 
+卸载面板并删除面板配置、运行状态和监控数据（不会删除 Agent）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jwjccc/xiaoji-dashboard/main/scripts/uninstall-panel.sh -o uninstall-panel.sh && chmod +x uninstall-panel.sh && sudo ./uninstall-panel.sh
+```
+
 This installs the hub panel as a systemd service. It does not bind other servers as agents; use the admin backend to generate per-server agent install commands after the panel is online.
 
 Manual run:
