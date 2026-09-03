@@ -13,12 +13,6 @@ curl -L https://raw.githubusercontent.com/jwjccc/xiaoji-dashboard/main/scripts/i
 curl -fsSL https://raw.githubusercontent.com/jwjccc/chicken-dashboard/main/scripts/uninstall-panel.sh -o uninstall-panel.sh && chmod +x uninstall-panel.sh && sudo ./uninstall-panel.sh
 ```
 
-目录
-```bash
-cd server-probe-monitor
-node hub/server.js
-```
-
 登录方式
 
 ```text
