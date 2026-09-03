@@ -79,7 +79,7 @@ curl -L https://raw.githubusercontent.com/jwjccc/xiaoji-dashboard/main/scripts/i
 卸载面板并删除面板配置、运行状态和监控数据（不会删除 Agent）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jwjccc/xiaoji-dashboard/main/scripts/uninstall-panel.sh -o uninstall-panel.sh && chmod +x uninstall-panel.sh && sudo ./uninstall-panel.sh
+sudo bash -c 'read -r -p "是否卸载面板并删除全部数据？[Y/N] " a; [[ "$a" =~ ^[Yy]$ ]] || exit 0; systemctl disable --now server-probe-monitor.service 2>/dev/null || true; rm -f /etc/systemd/system/server-probe-monitor.service; systemctl daemon-reload; rm -rf -- /opt/server-probe-monitor'
 ```
 
 This installs the hub panel as a systemd service. It does not bind other servers as agents; use the admin backend to generate per-server agent install commands after the panel is online.

@@ -13,10 +13,25 @@ SERVER_NAME="${SERVER_NAME:-$(hostname)}"
 SERVER_LOCATION="${SERVER_LOCATION:-}"
 INTERVAL="${INTERVAL:-2}"
 CONNECTIVITY_INTERVAL="${CONNECTIVITY_INTERVAL:-60}"
-INSTALL_DIR="/opt/server-probe-agent"
-SERVICE_FILE="/etc/systemd/system/server-probe-agent.service"
-ENV_FILE="/etc/server-probe-agent.env"
+# One host may report to several panels. Derive an isolated instance name from
+# the panel URL so another panel cannot overwrite this agent's files/service.
+INSTANCE_ID="$(printf '%s' "$HUB_URL" | sha256sum | cut -c1-12)"
+INSTALL_DIR="/opt/server-probe-agent-${INSTANCE_ID}"
+SERVICE_NAME="server-probe-agent-${INSTANCE_ID}.service"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
+ENV_FILE="/etc/${SERVICE_NAME}.env"
 SOURCE_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
+
+# Migrate the legacy fixed-name agent only when it belongs to this same panel.
+# A legacy agent connected to another panel must remain untouched.
+if [[ -f /etc/server-probe-agent.env ]]; then
+  OLD_HUB_URL="$(bash -c 'source /etc/server-probe-agent.env 2>/dev/null; printf %s "${HUB_URL:-}"' || true)"
+  if [[ "$OLD_HUB_URL" == "$HUB_URL" ]]; then
+    systemctl disable --now server-probe-agent.service 2>/dev/null || true
+    rm -f /etc/systemd/system/server-probe-agent.service /etc/server-probe-agent.env
+    rm -rf /opt/server-probe-agent
+  fi
+fi
 
 reject_unsafe_value() {
   local name="$1" value="$2"
@@ -81,10 +96,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=/etc/server-probe-agent.env
+EnvironmentFile=$ENV_FILE
 Environment="CONNECTIONS_TTL_SECONDS=2"
 Environment="NODE_OPTIONS=--max-old-space-size=48 --max-semi-space-size=2"
-ExecStart=/bin/sh -c 'if command -v node >/dev/null 2>&1 && [ -f /opt/server-probe-agent/probe-node.cjs ]; then exec node /opt/server-probe-agent/probe-node.cjs; else exec /opt/server-probe-agent/probe.sh; fi'
+ExecStart=/bin/sh -c 'if command -v node >/dev/null 2>&1 && [ -f $INSTALL_DIR/probe-node.cjs ]; then exec node $INSTALL_DIR/probe-node.cjs; else exec $INSTALL_DIR/probe.sh; fi'
 Restart=always
 RestartSec=5
 
@@ -95,6 +110,6 @@ chmod 0644 "$SERVICE_FILE.new"
 mv -f "$SERVICE_FILE.new" "$SERVICE_FILE"
 
 systemctl daemon-reload
-systemctl enable server-probe-agent.service
-systemctl restart server-probe-agent.service
-systemctl status server-probe-agent.service --no-pager
+systemctl enable "$SERVICE_NAME"
+systemctl restart "$SERVICE_NAME"
+systemctl status "$SERVICE_NAME" --no-pager
