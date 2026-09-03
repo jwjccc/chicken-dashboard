@@ -88,7 +88,7 @@ rm -f "$INSTALL_DIR/probe-node.js"
 chmod 0600 "$ENV_FILE.new"
 mv -f "$ENV_FILE.new" "$ENV_FILE"
 
-cat > "$SERVICE_FILE.new" <<'SERVICE'
+cat > "$SERVICE_FILE.new" <<SERVICE
 [Unit]
 Description=Server Probe Monitor Agent
 After=network-online.target
