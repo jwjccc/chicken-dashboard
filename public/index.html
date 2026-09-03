@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN" class="icons-pending">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#ffffff">
+  <meta name="theme-color" media="(prefers-color-scheme: light)" content="#ffffff">
+  <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#ffffff">
+  <meta name="color-scheme" content="light">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <title>服务器监控面板</title>
+  <link id="site-favicon" rel="icon" href="data:,">
+  <link rel="preload" href="/fonts/MaterialIcons-Regular.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/css/material-icons.css">
+  <link rel="stylesheet" href="/css/style.min.css">
+  <link rel="stylesheet" href="/css/components/card.css">
+  <style id="startup-hide-style">
+    html, body { background: #f8fafc; }
+    body.light-mode { background: #f8fafc !important; color: #1e293b !important; }
+    html:not(.app-ready) #app-root { visibility: hidden; }
+    html.icons-pending .material-icons {
+      color: transparent !important;
+      text-shadow: none !important;
+    }
+  </style>
+  <script>
+    document.documentElement.classList.add('icons-pending');
+    if (document.fonts && document.fonts.load) {
+      document.fonts.load('24px "Material Icons"', 'dns')
+        .then(() => document.fonts.ready)
+        .then(() => document.documentElement.classList.remove('icons-pending'))
+        .catch(() => document.documentElement.classList.add('icons-font-failed'));
+    } else if (!document.fonts) {
+      document.documentElement.classList.remove('icons-pending');
+    }
+  </script>
+  <!--__PANEL_BOOTSTRAP__-->
+  <link rel="stylesheet" href="/styles.css?v=panel-fixes-20260818g">
+</head>
+<body class="light-mode min-h-screen bg-white text-slate-900 antialiased">
+  <div id="frontend-background-layer" class="panel-background-layer panel-background-frontend" aria-hidden="true"></div>
+  <div id="admin-background-layer" class="panel-background-layer panel-background-admin" aria-hidden="true"></div>
+  <div id="app-root"></div>
+  <script src="/echarts.min.js"></script>
+  <script src="/app.js?v=panel-fixes-20260818g" type="module"></script>
+</body>
+</html>

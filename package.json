@@ -1,0 +1,14 @@
+{
+  "name": "server-probe-monitor",
+  "version": "0.1.0",
+  "description": "Lightweight self-hosted server status monitor with a hub dashboard and Linux probe agent.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node hub/server.js",
+    "dev": "PROBE_PORT=8080 node hub/server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

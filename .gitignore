@@ -1,0 +1,7 @@
+# Runtime state and credentials (never commit)
+data/config.json
+data/state.json
+data/state.json.*
+
+# Atomic-write leftovers
+*.tmp
