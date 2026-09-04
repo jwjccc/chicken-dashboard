@@ -210,20 +210,12 @@ async function loadOverview() {
 }
 
 function connectEvents() {
+  // Do not keep a permanent SSE response open. Some direct mobile routes stop
+  // acknowledging that stream after the first packets; repeated refreshes then
+  // leave half-open sockets and make the panel appear whitelist-blocked. The
+  // existing visible-page poll below provides bounded, reliable refreshes.
   eventSource?.close();
-  eventSource = new EventSource(`/api/events?viewerId=${encodeURIComponent(viewerClientId)}`);
-  eventSource.onmessage = (event) => {
-    let payload;
-    try {
-      payload = JSON.parse(event.data);
-    } catch {
-      return;
-    }
-    if (!payload || typeof payload !== 'object') return;
-    if (payload.onlineViewers) updateOnlineViewers(payload.onlineViewers);
-    if (payload.type === 'presence' || payload.type === 'hello') return;
-    if (payload.type === 'refresh') scheduleRefresh(payload.id);
-  };
+  eventSource = null;
 }
 
 function getViewerClientId() {
