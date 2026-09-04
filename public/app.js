@@ -23,16 +23,22 @@ if (isAdminPath(location.pathname)) {
 const fmt = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 1 });
 let overview = null;
 let activeServerId = null;
-// Aggregate bandwidth arrives with slightly different sample timestamps per
-// agent. Smooth only the header display so it does not flicker between samples;
-// raw per-server values and totals remain untouched.
-const headerBandwidthEwma = { down: null, up: null };
-function smoothHeaderBandwidth(value, key) {
-  const next = Math.max(0, Number(value) || 0);
-  const previous = headerBandwidthEwma[key];
-  const smoothed = previous == null ? next : previous * 0.65 + next * 0.35;
-  headerBandwidthEwma[key] = smoothed;
-  return smoothed;
+// Aggregate header bandwidth in fixed 2-second report windows. Each server
+// contributes only its newest sample in that window; do not blend values from
+// different timestamps and do not apply an artificial weighted average.
+const HEADER_BANDWIDTH_WINDOW_MS = 2000;
+function snapshotHeaderBandwidth(servers) {
+  const rows = Array.isArray(servers) ? servers : [];
+  const newestAt = rows.reduce((max, server) => Math.max(max, Number(server.lastReportAt || 0)), 0);
+  if (!newestAt) return { down: 0, up: 0 };
+  const cutoff = newestAt - HEADER_BANDWIDTH_WINDOW_MS;
+  return rows.reduce((total, server) => {
+    const reportedAt = Number(server.lastReportAt || 0);
+    if (reportedAt < cutoff || reportedAt > newestAt) return total;
+    total.down += Number(server.net?.inBps || 0);
+    total.up += Number(server.net?.outBps || 0);
+    return total;
+  }, { down: 0, up: 0 });
 }
 let clockTimer = null;
 const chartConfigs = [
@@ -1721,8 +1727,9 @@ function errorMessage(err) {
 }
 
 function renderOverview(data) {
-  const downSpeed = smoothHeaderBandwidth(sum(data.servers, (s) => s.net.inBps), 'down');
-  const upSpeed = smoothHeaderBandwidth(sum(data.servers, (s) => s.net.outBps), 'up');
+  const bandwidthSnapshot = snapshotHeaderBandwidth(data.servers);
+  const downSpeed = bandwidthSnapshot.down;
+  const upSpeed = bandwidthSnapshot.up;
   const servers = filterServersByStatus(data.servers || []);
   $('#nav-title').textContent = data.title || '服务器监控面板';
   setText('total-nodes', data.totals.total);
