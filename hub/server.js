@@ -18,6 +18,7 @@ const agentProbePath = path.join(rootDir, 'agent', 'probe.sh');
 const agentNodeProbePath = path.join(rootDir, 'agent', 'probe-node.cjs');
 const configPath = path.join(dataDir, 'config.json');
 const statePath = path.join(dataDir, 'state.json');
+const backgroundCacheDir = path.join(dataDir, 'background-cache');
 const MAX_SERVERS = 500;
 const MAX_PENDING_INSTALLS = 500;
 const MAX_CONNECTIVITY_CHECKS = 200;
@@ -2049,33 +2050,69 @@ async function serveBackgroundProxy(req, res, url) {
   if (!/^[a-f0-9]{32}$/.test(id)) return sendNotFound(res);
   const source = findBackgroundUrl(id);
   if (!source || !/^https?:\/\//i.test(source)) return sendNotFound(res);
+  const cacheFile = path.join(backgroundCacheDir, `${id}.image`);
+  const metaFile = path.join(backgroundCacheDir, `${id}.json`);
   try {
-    const target = await resolvePublicHttpUrl(source);
-    await new Promise((resolve, reject) => {
-      const transport = target.url.protocol === 'https:' ? https : http;
-      const upstream = transport.request(target.url, {
-        method: 'GET', headers: { Accept: 'image/*', 'User-Agent': 'server-probe-monitor' },
-        lookup: (_hostname, options, callback) => callback(null, target.address, target.family),
-        servername: target.url.hostname, timeout: 12_000
-      }, (response) => {
-        if (response.statusCode < 200 || response.statusCode >= 300 || (response.statusCode >= 300 && response.statusCode < 400)) { response.resume(); return reject(new Error('bad_status')); }
-        const type = String(response.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
-        const declared = Number(response.headers['content-length'] || 0);
-        if (!type.startsWith('image/') || declared > 20 * 1024 * 1024) { response.resume(); return reject(Object.assign(new Error('image_too_large'), { tooLarge: declared > 20 * 1024 * 1024 })); }
-        res.writeHead(200, securityHeaders({ 'Content-Type': type, 'Cache-Control': 'public, max-age=86400, stale-while-revalidate=604800' }));
-        let size = 0;
-        response.on('data', (chunk) => { size += chunk.length; if (size > 20 * 1024 * 1024) { upstream.destroy(); res.destroy(); } else if (!res.write(chunk)) response.pause(); });
-        res.on('drain', () => response.resume());
-        response.on('end', () => { if (!res.destroyed) res.end(); resolve(); });
-        response.on('error', reject);
-      });
-      upstream.on('timeout', () => upstream.destroy(new Error('timeout')));
-      upstream.on('error', reject); upstream.end();
-    });
+    const cached = await readCachedBackground(cacheFile, metaFile);
+    if (cached) return sendCachedBackground(req, res, id, cached);
+    const fetched = await fetchBackgroundImage(source);
+    await mkdir(backgroundCacheDir, { recursive: true });
+    await Promise.all([
+      writeFile(cacheFile, fetched.body, { mode: 0o600 }),
+      writeFile(metaFile, `${JSON.stringify({ type: fetched.type, source, cachedAt: Date.now() })}\n`, { mode: 0o600 })
+    ]);
+    return sendCachedBackground(req, res, id, fetched);
   } catch (err) {
+    const cached = await readCachedBackground(cacheFile, metaFile).catch(() => null);
+    if (cached) return sendCachedBackground(req, res, id, cached);
     if (!res.headersSent) return err?.tooLarge ? sendJson(res, { error: 'image_too_large' }, 413) : sendNotFound(res);
     if (!res.destroyed) res.destroy();
   }
+}
+
+async function readCachedBackground(cacheFile, metaFile) {
+  try {
+    const [body, rawMeta] = await Promise.all([readFile(cacheFile), readFile(metaFile, 'utf8')]);
+    const meta = JSON.parse(rawMeta);
+    return body.length && String(meta.type || '').startsWith('image/') ? { body, type: meta.type } : null;
+  } catch { return null; }
+}
+
+function sendCachedBackground(req, res, id, image) {
+  const etag = `"bg-${id}"`;
+  const headers = securityHeaders({ 'Content-Type': image.type, 'Cache-Control': 'public, max-age=604800, immutable', ETag: etag });
+  if (req.headers['if-none-match'] === etag) { res.writeHead(304, headers); return res.end(); }
+  res.writeHead(200, { ...headers, 'Content-Length': image.body.length });
+  res.end(image.body);
+}
+
+async function fetchBackgroundImage(value, redirects = 0) {
+  if (redirects > 4) throw new Error('too_many_redirects');
+  const target = await resolvePublicHttpUrl(value);
+  return new Promise((resolve, reject) => {
+    const transport = target.url.protocol === 'https:' ? https : http;
+    const upstream = transport.request(target.url, {
+      method: 'GET', headers: { Accept: 'image/*', 'User-Agent': 'Mozilla/5.0 ServerProbeMonitor/1.0' },
+      lookup: (_hostname, _options, callback) => callback(null, target.address, target.family),
+      servername: target.url.hostname, timeout: 20_000
+    }, (response) => {
+      if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+        response.resume();
+        const next = new URL(response.headers.location, target.url).toString();
+        return fetchBackgroundImage(next, redirects + 1).then(resolve, reject);
+      }
+      if (response.statusCode < 200 || response.statusCode >= 300) { response.resume(); return reject(new Error('bad_status')); }
+      const type = String(response.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+      const declared = Number(response.headers['content-length'] || 0);
+      if (!type.startsWith('image/') || declared > 20 * 1024 * 1024) { response.resume(); return reject(Object.assign(new Error('image_too_large'), { tooLarge: declared > 20 * 1024 * 1024 })); }
+      const chunks = []; let size = 0;
+      response.on('data', (chunk) => { size += chunk.length; if (size > 20 * 1024 * 1024) upstream.destroy(Object.assign(new Error('image_too_large'), { tooLarge: true })); else chunks.push(chunk); });
+      response.on('end', () => resolve({ body: Buffer.concat(chunks), type }));
+      response.on('error', reject);
+    });
+    upstream.on('timeout', () => upstream.destroy(new Error('timeout')));
+    upstream.on('error', reject); upstream.end();
+  });
 }
 
 async function resolvePublicHttpUrl(value) {
@@ -2084,6 +2121,10 @@ async function resolvePublicHttpUrl(value) {
   const addresses = await lookup(parsed.hostname, { all: true, verbatim: true });
   const valid = addresses.filter(({ address }) => !isPrivateIp(address) && address !== '0.0.0.0' && address !== '::');
   if (!addresses.length || valid.length !== addresses.length) throw new Error('private_background_target');
+  // Prefer IPv4 on hosts whose panel server has no working IPv6 route. DNS
+  // answers commonly list IPv6 first, which previously made image loading fail
+  // even though a healthy IPv4 CDN address was available.
+  valid.sort((left, right) => Number(right.family === 4) - Number(left.family === 4));
   return { url: parsed, address: valid[0].address, family: valid[0].family };
 }
 
@@ -2849,7 +2890,6 @@ function sendNotFound(res) {
   res.writeHead(404, securityHeaders({
     'Content-Type': 'text/html; charset=utf-8',
     'Cache-Control': 'no-store, max-age=0',
-    'Clear-Site-Data': '"cache"',
     'Set-Cookie': 'whitelist_access=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0'
   }));
   res.end('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="data:,"><title>404 Not Found</title><style>html,body{height:100%;margin:0}body{display:grid;place-items:center;font:700 clamp(2.5rem,8vw,6rem)/1.1 Arial,sans-serif;color:#111;background:#fff}</style></head><body>404 Not Found</body></html>');
