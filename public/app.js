@@ -34,7 +34,9 @@ function snapshotHeaderBandwidth(servers) {
   const cutoff = newestAt - HEADER_BANDWIDTH_WINDOW_MS;
   return rows.reduce((total, server) => {
     const reportedAt = Number(server.lastReportAt || 0);
-    if (reportedAt < cutoff || reportedAt > newestAt) return total;
+    // An offline node's last sample is historical state, not current
+    // bandwidth. Never include it in the header snapshot.
+    if (!server.online || reportedAt < cutoff || reportedAt > newestAt) return total;
     total.down += Number(server.net?.inBps || 0);
     total.up += Number(server.net?.outBps || 0);
     return total;
