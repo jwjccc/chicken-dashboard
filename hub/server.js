@@ -1794,7 +1794,15 @@ function handleEvents(req, res) {
 
 function broadcast(payload) {
   const data = `data: ${JSON.stringify(payload)}\n\n`;
-  for (const client of clients.keys()) client.write(data);
+  for (const client of clients.keys()) {
+    if (client.destroyed || client.writableEnded || client.writableNeedDrain || !client.write(data)) {
+      // SSE is a notification channel, not a durable queue. A slow or detached
+      // browser must reconnect instead of retaining an ever-growing response
+      // buffer that eventually stalls other panel requests from the same phone.
+      clients.delete(client);
+      client.destroy();
+    }
+  }
 }
 
 function sendJson(res, data, status = 200, headers = {}) {
@@ -2473,7 +2481,7 @@ function recordViewerPresence(req, inputViewerId = '') {
   return viewerId;
 }
 
-function recordViewerAccess(req) {
+function recordViewerAccess(req, persist = true) {
   const ip = clientKey(req);
   const client = inferClientDevice(req);
   const now = Date.now();
@@ -2487,7 +2495,7 @@ function recordViewerAccess(req) {
   state.viewerAccess = current
     .sort((a, b) => Number(b.lastAccessAt || 0) - Number(a.lastAccessAt || 0))
     .slice(0, 100);
-  saveState().catch((err) => console.error(err));
+  if (persist) saveStateSoon().catch((err) => console.error(err));
   return state.viewerAccess.find((item) => item.ip === ip) || { ip, firstAccessAt: now, lastAccessAt: now };
 }
 
@@ -2516,9 +2524,13 @@ function recordBlockedWhitelistAccess(req) {
 async function handleViewerHeartbeat(req, res) {
   const input = await readBody(req);
   const viewerId = recordViewerPresence(req, input.viewerId);
-  const viewer = recordViewerAccess(req);
+  // Presence heartbeats are intentionally memory-only. The initial page/SSE
+  // connection already records access; rewriting the full state every five
+  // seconds caused avoidable CPU, allocation and I/O pressure.
+  const viewer = recordViewerAccess(req, false);
   const onlineViewers = onlineViewerStats();
-  broadcast({ type: 'presence', at: Date.now(), onlineViewers });
+  // Do not fan out a presence event for every five-second heartbeat. That made
+  // N viewers generate N² SSE traffic and filled slow mobile response buffers.
   return sendJson(res, { ok: true, viewerId, viewer, onlineViewers });
 }
 
