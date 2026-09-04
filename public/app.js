@@ -530,8 +530,11 @@ async function applyBackgrounds(backgrounds = {}) {
   const seq = ++backgroundApplySeq;
   const isMobile = window.matchMedia('(max-width: 640px)').matches;
   const selected = window.__SPM_SELECTED_BACKGROUNDS__ || {};
-  const frontendCandidates = backgroundsDisabled ? [] : backgroundCandidates(currentBackgrounds, isMobile ? 'frontendMobile' : 'frontendDesktop', 'frontend', isMobile ? selected.frontendMobile : selected.frontendDesktop);
-  const adminCandidates = backgroundsDisabled ? [] : backgroundCandidates(currentBackgrounds, isMobile ? 'adminMobile' : 'adminDesktop', 'admin', isMobile ? selected.adminMobile : selected.adminDesktop);
+  // Mobile falls back to the desktop list when no dedicated mobile image is
+  // configured. This prevents a valid backend image from disappearing only on
+  // phones after a refresh.
+  const frontendCandidates = backgroundsDisabled ? [] : backgroundCandidates(currentBackgrounds, isMobile ? 'frontendMobile' : 'frontendDesktop', isMobile ? 'frontendDesktop' : 'frontend', isMobile ? selected.frontendMobile : selected.frontendDesktop);
+  const adminCandidates = backgroundsDisabled ? [] : backgroundCandidates(currentBackgrounds, isMobile ? 'adminMobile' : 'adminDesktop', isMobile ? 'adminDesktop' : 'admin', isMobile ? selected.adminMobile : selected.adminDesktop);
 
   // Keep the last successfully decoded image visible while a newly selected URL
   // loads. This mirrors Nezha's session recovery idea and adds an atomic swap, so

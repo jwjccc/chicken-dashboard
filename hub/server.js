@@ -6,7 +6,7 @@ import { createHash, randomBytes, scrypt, scryptSync, timingSafeEqual } from 'no
 import { lookup } from 'node:dns/promises';
 import { promisify } from 'node:util';
 import { readFile, writeFile, mkdir, rename, chmod } from 'node:fs/promises';
-import { existsSync, createReadStream, writeFileSync, readFileSync, renameSync, chmodSync, statSync } from 'node:fs';
+import { existsSync, createReadStream, writeFileSync, renameSync, chmodSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -34,7 +34,6 @@ const connectivityHistory = new Map();
 let config = await loadConfig();
 let state = await loadState();
 let normalizedWhitelistCache = { source: null, items: [] };
-let configMtimeMs = 0;
 hydrateConnectivityState();
 let stateWriteQueue = Promise.resolve();
 let configWriteQueue = Promise.resolve();
@@ -62,11 +61,9 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
-    // The panel can be fronted by a supervisor or run alongside an older
-    // worker. Refresh the small security portion from disk before *every*
-    // request so disabling the whitelist takes effect for HTML, assets, API
-    // and SSE immediately, instead of leaving a stale worker denying refreshes.
-    refreshWhitelistConfigFromDisk();
+    // Security gate: disabled means immediate unconditional pass-through.
+    // Keep this synchronous and in-memory; reading config from disk per request
+    // can block the event loop and amplify refresh timeouts under load.
     if (!isWhitelistAllowed(req, url)) return sendNotFound(res);
 
     if (req.method === 'OPTIONS') return handleOptions(res);
@@ -1947,25 +1944,13 @@ function normalizeClientIp(value) {
   return ip;
 }
 
-function refreshWhitelistConfigFromDisk() {
-  try {
-    const mtimeMs = statSync(configPath).mtimeMs;
-    if (mtimeMs === configMtimeMs) return;
-    const diskConfig = JSON.parse(readFileSync(configPath, 'utf8'));
-    config.ipWhitelist = Array.isArray(diskConfig.ipWhitelist) ? diskConfig.ipWhitelist : [];
-    config.ipWhitelistEnabled = diskConfig.ipWhitelistEnabled === true;
-    configMtimeMs = mtimeMs;
-    normalizedWhitelistCache = { source: null, items: [] };
-  } catch (err) {
-    // Keep the last known-good config if a concurrent atomic write is observed.
-    if (err?.code !== 'ENOENT') console.error('Unable to refresh whitelist config:', err.message);
-  }
-}
-
 function isWhitelistAllowed(req, url) {
   if (isWhitelistExemptPath(url?.pathname || '')) return true;
+  // This is deliberately the first policy check: when disabled, do not even
+  // resolve the client IP or normalize the list.
+  if (config.ipWhitelistEnabled !== true) return true;
   const whitelist = getNormalizedWhitelist();
-  if (!config.ipWhitelistEnabled || !whitelist.length) return true;
+  if (!whitelist.length) return true;
   const allowed = isIpAllowedByWhitelist(clientKey(req), whitelist);
   if (!allowed) recordBlockedWhitelistAccess(req);
   return allowed;
