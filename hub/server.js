@@ -2099,7 +2099,9 @@ async function fetchBackgroundImage(value, redirects = 0) {
     const transport = target.url.protocol === 'https:' ? https : http;
     const upstream = transport.request(target.url, {
       method: 'GET', headers: { Accept: 'image/*', 'User-Agent': 'Mozilla/5.0 ServerProbeMonitor/1.0' },
-      lookup: (_hostname, _options, callback) => callback(null, target.address, target.family),
+      lookup: (_hostname, options, callback) => options?.all
+        ? callback(null, [{ address: target.address, family: target.family }])
+        : callback(null, target.address, target.family),
       servername: target.url.hostname, timeout: 20_000
     }, (response) => {
       if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
