@@ -39,12 +39,19 @@ ensure_dependencies() {
     exit 1
   }
   command -v node >/dev/null 2>&1 || {
-    echo "node is required. Install Node.js 18+ first and rerun this script." >&2
+    echo "node is required. Install Node.js 22.5+ first and rerun this script." >&2
     exit 1
   }
 }
 
 ensure_dependencies
+NODE_VERSION="$(node -p 'process.versions.node')"
+NODE_MAJOR="${NODE_VERSION%%.*}"
+NODE_MINOR="${NODE_VERSION#*.}"; NODE_MINOR="${NODE_MINOR%%.*}"
+if (( NODE_MAJOR < 22 )) || (( NODE_MAJOR == 22 && NODE_MINOR < 5 )); then
+  echo "Node.js 22.5+ is required (found ${NODE_VERSION}); refusing to install a service that cannot start." >&2
+  exit 1
+fi
 
 mkdir -p "$(dirname "$INSTALL_DIR")"
 if [[ -d "$INSTALL_DIR/.git" ]]; then
@@ -76,6 +83,9 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=$INSTALL_DIR
 Environment=PROBE_PORT=$PORT
+Environment=MAX_CONNECTIVITY_HISTORY_POINTS=100000
+Environment=HISTORY_SAMPLE_INTERVAL_MS=1000
+Environment="NODE_OPTIONS=--max-old-space-size=256 --max-semi-space-size=8"
 ExecStart=/usr/bin/env node hub/server.js
 Restart=always
 RestartSec=5
@@ -86,6 +96,12 @@ SERVICE
 
 systemctl daemon-reload
 systemctl enable --now "$SERVICE_NAME.service"
+sleep 1
+if ! systemctl is-active --quiet "$SERVICE_NAME.service"; then
+  echo "Panel failed to start; recent logs:" >&2
+  journalctl -u "$SERVICE_NAME.service" -n 80 --no-pager >&2
+  exit 1
+fi
 systemctl status "$SERVICE_NAME.service" --no-pager
 
 echo
