@@ -1,5 +1,6 @@
 import http from 'node:http';
 import https from 'node:https';
+import { createGzip } from 'node:zlib';
 import net from 'node:net';
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes, scrypt, scryptSync, timingSafeEqual } from 'node:crypto';
@@ -2862,12 +2863,26 @@ function serveStatic(req, requestPath, res) {
     headers['Cache-Control'] = 'public, max-age=2592000, immutable';
   } else if (path.basename(filePath) === 'echarts.min.js') {
     headers['Cache-Control'] = 'public, max-age=86400';
-  } else if (['.js', '.css'].includes(ext)) headers['Cache-Control'] = 'no-cache';
+  } else if (['.js', '.css'].includes(ext)) {
+    // These URLs carry an explicit release version in index.html. Reusing them
+    // avoids repeatedly transferring the whole application over weak mobile
+    // routes; a new release version still invalidates the browser cache.
+    headers['Cache-Control'] = 'public, max-age=86400, stale-while-revalidate=604800';
+  }
   const stream = createReadStream(filePath);
   stream.on('error', () => {
     if (!res.headersSent) sendNotFound(res);
     else res.destroy();
   });
+  const acceptsGzip = /(?:^|,)\s*gzip\s*(?:,|$)/i.test(String(req.headers['accept-encoding'] || ''));
+  if (acceptsGzip && ['.js', '.css', '.html', '.json', '.svg'].includes(ext)) {
+    headers['Content-Encoding'] = 'gzip';
+    headers.Vary = 'Accept-Encoding';
+    res.writeHead(200, securityHeaders(headers));
+    const gzip = createGzip({ level: 6 });
+    gzip.on('error', () => res.destroy());
+    return stream.pipe(gzip).pipe(res);
+  }
   res.writeHead(200, securityHeaders(headers));
   stream.pipe(res);
 }
