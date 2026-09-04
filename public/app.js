@@ -23,6 +23,17 @@ if (isAdminPath(location.pathname)) {
 const fmt = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 1 });
 let overview = null;
 let activeServerId = null;
+// Aggregate bandwidth arrives with slightly different sample timestamps per
+// agent. Smooth only the header display so it does not flicker between samples;
+// raw per-server values and totals remain untouched.
+const headerBandwidthEwma = { down: null, up: null };
+function smoothHeaderBandwidth(value, key) {
+  const next = Math.max(0, Number(value) || 0);
+  const previous = headerBandwidthEwma[key];
+  const smoothed = previous == null ? next : previous * 0.65 + next * 0.35;
+  headerBandwidthEwma[key] = smoothed;
+  return smoothed;
+}
 let clockTimer = null;
 const chartConfigs = [
   { id: 'load', keys: ['cpu', 'mem', 'swap'], labels: ['CPU', '内存', 'Swap'], units: ['%', '%', '%'], max: 100 },
@@ -37,6 +48,7 @@ const liveHistoryMaxPoints = 240;
 let refreshTimer = null;
 let visibleRefreshTimer = null;
 let eventSource = null;
+let sseConnected = false;
 let viewerHeartbeatTimer = null;
 let viewerLeaveSent = false;
 let overviewRefreshInFlight = false;
@@ -210,12 +222,24 @@ async function loadOverview() {
 }
 
 function connectEvents() {
-  // Do not keep a permanent SSE response open. Some direct mobile routes stop
-  // acknowledging that stream after the first packets; repeated refreshes then
-  // leave half-open sockets and make the panel appear whitelist-blocked. The
-  // existing visible-page poll below provides bounded, reliable refreshes.
+  // SSE is the fast path for updates. The bounded 2s poll remains as a
+  // recovery path if a mobile carrier/proxy drops the long-lived connection.
   eventSource?.close();
-  eventSource = null;
+  const viewerId = encodeURIComponent(viewerClientId || '');
+  eventSource = new EventSource(`/api/events?viewerId=${viewerId}`);
+  eventSource.onopen = () => { sseConnected = true; };
+  eventSource.onmessage = (event) => {
+    try {
+      const payload = JSON.parse(event.data || '{}');
+      if (payload.type === 'refresh') scheduleRefresh(payload.id || null);
+      else if (payload.type === 'presence') updateOnlineViewers(payload.onlineViewers);
+    } catch { /* ignore malformed transient event */ }
+  };
+  eventSource.onerror = () => {
+    // EventSource reconnects automatically. The 2s poll below is enabled only
+    // while SSE is unavailable, so healthy SSE does not cause duplicate loads.
+    sseConnected = false;
+  };
 }
 
 function getViewerClientId() {
@@ -230,10 +254,11 @@ function getViewerClientId() {
 
 function startVisibleRefreshTimer() {
   clearInterval(visibleRefreshTimer);
-  // SSE is the primary realtime path. This slower poll is only a recovery net.
+  // SSE is intentionally disabled on mobile; poll at the same 2s cadence as
+  // agent reports so the latest state is normally visible within one cycle.
   visibleRefreshTimer = setInterval(() => {
-    if (document.visibilityState === 'visible') refreshVisibleData().catch(() => null);
-  }, 10000);
+    if (document.visibilityState === 'visible' && !sseConnected) refreshVisibleData().catch(() => null);
+  }, 2000);
 }
 
 function startViewerPresenceHeartbeat() {
@@ -1696,8 +1721,8 @@ function errorMessage(err) {
 }
 
 function renderOverview(data) {
-  const downSpeed = sum(data.servers, (s) => s.net.inBps);
-  const upSpeed = sum(data.servers, (s) => s.net.outBps);
+  const downSpeed = smoothHeaderBandwidth(sum(data.servers, (s) => s.net.inBps), 'down');
+  const upSpeed = smoothHeaderBandwidth(sum(data.servers, (s) => s.net.outBps), 'up');
   const servers = filterServersByStatus(data.servers || []);
   $('#nav-title').textContent = data.title || '服务器监控面板';
   setText('total-nodes', data.totals.total);

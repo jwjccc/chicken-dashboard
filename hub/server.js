@@ -10,6 +10,7 @@ import { readFile, writeFile, mkdir, rename, chmod } from 'node:fs/promises';
 import { existsSync, createReadStream, writeFileSync, renameSync, chmodSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { DatabaseSync } from 'node:sqlite';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
@@ -19,6 +20,7 @@ const agentProbePath = path.join(rootDir, 'agent', 'probe.sh');
 const agentNodeProbePath = path.join(rootDir, 'agent', 'probe-node.cjs');
 const configPath = path.join(dataDir, 'config.json');
 const statePath = path.join(dataDir, 'state.json');
+const connectivityHistoryDbPath = path.join(dataDir, 'connectivity-history.sqlite');
 const backgroundCacheDir = path.join(dataDir, 'background-cache');
 const MAX_SERVERS = 500;
 const MAX_PENDING_INSTALLS = 500;
@@ -34,6 +36,8 @@ const connectivityResults = new Map();
 const connectivityHistory = new Map();
 let config = await loadConfig();
 let state = await loadState();
+const connectivityDb = openConnectivityHistoryDb();
+void migrateConnectivityHistory();
 let normalizedWhitelistCache = { source: null, items: [] };
 hydrateConnectivityState();
 let stateWriteQueue = Promise.resolve();
@@ -59,6 +63,26 @@ const prunedAtStartup = pruneStateHistory();
 if (prunedAtStartup) saveStateNow().catch((err) => console.error(err));
 
 const server = http.createServer(async (req, res) => {
+  const requestStartedAt = Date.now();
+  const requestIp = normalizeClientIp(req.socket?.remoteAddress || 'unknown');
+  const requestUrl = String(req.url || '/');
+  let responseBytes = 0;
+  const originalWrite = res.write.bind(res);
+  const originalEnd = res.end.bind(res);
+  res.write = (chunk, ...args) => {
+    if (chunk) responseBytes += Buffer.byteLength(chunk);
+    return originalWrite(chunk, ...args);
+  };
+  res.end = (chunk, ...args) => {
+    if (chunk) responseBytes += Buffer.byteLength(chunk);
+    return originalEnd(chunk, ...args);
+  };
+  res.once('finish', () => {
+    if (!requestUrl.startsWith('/api/agent/')) console.log(`[access] ip=${requestIp} method=${req.method} url=${requestUrl} status=${res.statusCode} bytes=${responseBytes} ms=${Date.now() - requestStartedAt}`);
+  });
+  res.once('close', () => {
+    if (!res.writableFinished && !requestUrl.startsWith('/api/agent/')) console.log(`[access-close] ip=${requestIp} method=${req.method} url=${requestUrl} status=${res.statusCode} bytes=${responseBytes} ms=${Date.now() - requestStartedAt}`);
+  });
   try {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
@@ -233,6 +257,50 @@ function hydrateConnectivityState() {
   for (const [id, history] of Object.entries(state.connectivityHistory || {})) {
     if (Array.isArray(history)) connectivityHistory.set(id, history);
   }
+}
+
+function openConnectivityHistoryDb() {
+  const database = new DatabaseSync(connectivityHistoryDbPath);
+  database.exec(`CREATE TABLE IF NOT EXISTS connectivity_history (
+    server_id TEXT NOT NULL, check_id TEXT NOT NULL, checked_at INTEGER NOT NULL,
+    latency_ms REAL, ok INTEGER NOT NULL, packet_loss_percent REAL,
+    PRIMARY KEY (server_id, check_id, checked_at)
+  ); CREATE INDEX IF NOT EXISTS connectivity_history_lookup
+    ON connectivity_history (server_id, check_id, checked_at);`);
+  return database;
+}
+
+function migrateConnectivityHistory() {
+  const insert = connectivityDb.prepare(`INSERT OR IGNORE INTO connectivity_history
+    (server_id, check_id, checked_at, latency_ms, ok, packet_loss_percent)
+    VALUES (?, ?, ?, ?, ?, ?)`);
+  const cutoff = Date.now() - 15 * 24 * 60 * 60 * 1000;
+  for (const [serverId, server] of Object.entries(state.servers || {})) {
+    for (const item of Array.isArray(server?.connectivity) ? server.connectivity : []) {
+      for (const point of Array.isArray(item?.history) ? item.history : []) {
+        const t = Number(point?.t || 0);
+        if (t >= cutoff && t > 0) insert.run(serverId, String(item.id), t,
+          Number.isFinite(Number(point.latencyMs)) ? Number(point.latencyMs) : null,
+          point.ok ? 1 : 0, normalizePacketLossPercent(point.packetLossPercent, point.ok ? 0 : 100));
+      }
+    }
+  }
+  connectivityDb.prepare('DELETE FROM connectivity_history WHERE checked_at < ?').run(cutoff);
+}
+
+function readConnectivityHistory(serverId, checkId, cutoff) {
+  return connectivityDb.prepare(`SELECT checked_at AS t, latency_ms AS latencyMs,
+    ok, packet_loss_percent AS packetLossPercent FROM connectivity_history
+    WHERE server_id = ? AND check_id = ? AND checked_at >= ? ORDER BY checked_at ASC`).all(serverId, checkId, cutoff)
+    .map((point) => ({ ...point, ok: Boolean(point.ok) }));
+}
+
+function appendConnectivityHistory(serverId, checkId, point) {
+  connectivityDb.prepare(`INSERT OR IGNORE INTO connectivity_history
+    (server_id, check_id, checked_at, latency_ms, ok, packet_loss_percent)
+    VALUES (?, ?, ?, ?, ?, ?)`).run(serverId, checkId, point.t, point.latencyMs ?? null,
+      point.ok ? 1 : 0, point.packetLossPercent);
+  connectivityDb.prepare('DELETE FROM connectivity_history WHERE checked_at < ?').run(Date.now() - 15 * 24 * 60 * 60 * 1000);
 }
 
 function pruneStateHistory() {
@@ -424,10 +492,11 @@ async function handleAgentReport(req, res) {
     lastReportAt: now
   };
 
-  maybeAppendHistoryPoint(report.id, compactHistoryPoint(report, now), now);
-
-  saveStateSoon().catch((err) => console.error(err));
+  // Notify the UI immediately after the in-memory report is committed. Do not
+  // wait for history cleanup or state persistence before sending SSE.
   broadcast({ type: 'refresh', id: report.id, at: now });
+  maybeAppendHistoryPoint(report.id, compactHistoryPoint(report, now), now);
+  saveStateSoon().catch((err) => console.error(err));
   return sendJson(res, { ok: true, server: report.id });
 }
 
@@ -1239,7 +1308,7 @@ async function buildServerDetail(id, options = {}) {
   server.ipQuality = cachedServerIpQuality(report);
   return {
     server,
-    connectivity: publicServerConnectivityChecks(report.connectivity || [], report.lastReportAt || 0, options),
+    connectivity: await publicServerConnectivityChecks(id, report.connectivity || [], report.lastReportAt || 0, options),
     history: Array.isArray(state.history[id]) ? state.history[id].slice(-500) : [],
     point: compactHistoryPoint(report, report.lastReportAt || Date.now())
   };
@@ -2227,7 +2296,7 @@ function publicConnectivityCheck(check) {
   return { ...safeCheck, result: connectivityResults.get(check.id) || null, history: connectivityHistory.get(check.id) || [] };
 }
 
-function publicServerConnectivityChecks(results, serverLastReportAt = 0, options = {}) {
+async function publicServerConnectivityChecks(serverId, results, serverLastReportAt = 0, options = {}) {
   const byId = new Map((Array.isArray(results) ? results : []).map((item) => [item.id, item]));
   const includeHistory = Boolean(options.includeConnectivityHistory);
   const rangeDays = clampInteger(options.connectivityRangeDays || 1, 1, 15, 1);
@@ -2238,8 +2307,9 @@ function publicServerConnectivityChecks(results, serverLastReportAt = 0, options
     const checkedAt = Number(item.checkedAt || 0);
     const hasServerResult = checkedAt > 0;
     const packetLossPercent = normalizePacketLossPercent(item.packetLossPercent ?? item.packetLoss, item.ok ? 0 : 100);
-    const history = includeHistory && Array.isArray(item.history)
-      ? aggregateConnectivityHistory(item.history, cutoff, rangeDays, check.intervalSeconds)
+    const historyPoints = includeHistory ? readConnectivityHistory(serverId, check.id, cutoff) : [];
+    const history = includeHistory
+      ? aggregateConnectivityHistory(historyPoints, cutoff, rangeDays, check.intervalSeconds)
       : [];
     return {
       id: check.id,
@@ -2278,9 +2348,8 @@ function mergeServerConnectivity(serverId, results) {
     const ok = Boolean(item.ok && latencyMs > 0);
     const packetLossPercent = normalizePacketLossPercent(item.packetLossPercent ?? item.packetLoss, ok ? 0 : 100);
     const point = { t: checkedAt, latencyMs, ok, packetLossPercent };
-    const history = [...(Array.isArray(prior.history) ? prior.history : []), point]
-      .filter((entry) => Number(entry.t || 0) >= now - 15 * 24 * 60 * 60 * 1000)
-      .slice(-MAX_CONNECTIVITY_HISTORY_POINTS);
+    appendConnectivityHistory(serverId, check.id, point);
+    const history = [];
     return {
       id: check.id,
       name: check.name,
