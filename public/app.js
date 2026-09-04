@@ -23,24 +23,34 @@ if (isAdminPath(location.pathname)) {
 const fmt = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 1 });
 let overview = null;
 let activeServerId = null;
-// Aggregate header bandwidth in fixed 2-second report windows. Each server
-// contributes only its newest sample in that window; do not blend values from
-// different timestamps and do not apply an artificial weighted average.
+// Take one fixed aggregate snapshot every 2 seconds. Incoming overview
+// responses only update each online server's latest sample; the displayed
+// header value changes at the next tick, so staggered reports cannot make it
+// flicker between partial sums.
 const HEADER_BANDWIDTH_WINDOW_MS = 2000;
+const headerBandwidthSamples = new Map();
+let headerBandwidthSnapshot = { down: 0, up: 0 };
+let headerBandwidthNextTick = 0;
 function snapshotHeaderBandwidth(servers) {
-  const rows = Array.isArray(servers) ? servers : [];
-  const newestAt = rows.reduce((max, server) => Math.max(max, Number(server.lastReportAt || 0)), 0);
-  if (!newestAt) return { down: 0, up: 0 };
-  const cutoff = newestAt - HEADER_BANDWIDTH_WINDOW_MS;
-  return rows.reduce((total, server) => {
-    const reportedAt = Number(server.lastReportAt || 0);
-    // An offline node's last sample is historical state, not current
-    // bandwidth. Never include it in the header snapshot.
-    if (!server.online || reportedAt < cutoff || reportedAt > newestAt) return total;
-    total.down += Number(server.net?.inBps || 0);
-    total.up += Number(server.net?.outBps || 0);
-    return total;
-  }, { down: 0, up: 0 });
+  for (const server of (Array.isArray(servers) ? servers : [])) {
+    if (server.online) {
+      headerBandwidthSamples.set(server.id, {
+        down: Number(server.net?.inBps || 0),
+        up: Number(server.net?.outBps || 0)
+      });
+    } else {
+      headerBandwidthSamples.delete(server.id);
+    }
+  }
+  const now = Date.now();
+  if (!headerBandwidthNextTick || now >= headerBandwidthNextTick) {
+    headerBandwidthSnapshot = [...headerBandwidthSamples.values()].reduce((total, sample) => ({
+      down: total.down + sample.down,
+      up: total.up + sample.up
+    }), { down: 0, up: 0 });
+    headerBandwidthNextTick = now - (now % HEADER_BANDWIDTH_WINDOW_MS) + HEADER_BANDWIDTH_WINDOW_MS;
+  }
+  return headerBandwidthSnapshot;
 }
 let clockTimer = null;
 const chartConfigs = [
