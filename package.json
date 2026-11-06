@@ -6,9 +6,10 @@
   "type": "module",
   "scripts": {
     "start": "node hub/server.js",
-    "dev": "PROBE_PORT=8080 node hub/server.js"
+    "dev": "PROBE_PORT=8080 node hub/server.js",
+    "test": "node --test tests/*.test.mjs"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22.5"
   }
 }

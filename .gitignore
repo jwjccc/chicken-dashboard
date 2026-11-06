@@ -5,3 +5,8 @@ data/state.json.*
 
 # Atomic-write leftovers
 *.tmp
+
+# Runtime databases and background image cache
+data/*.sqlite*
+data/background-cache/
+.test-runtime-*/

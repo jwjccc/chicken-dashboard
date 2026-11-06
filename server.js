@@ -7,13 +7,13 @@ import { createHash, randomBytes, scrypt, scryptSync, timingSafeEqual } from 'no
 import { lookup } from 'node:dns/promises';
 import { promisify } from 'node:util';
 import { readFile, writeFile, mkdir, rename, chmod } from 'node:fs/promises';
-import { existsSync, createReadStream, writeFileSync, renameSync, chmodSync, statSync } from 'node:fs';
+import { existsSync, createReadStream, readFileSync, readdirSync, writeFileSync, renameSync, chmodSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const rootDir = path.resolve(__dirname, '..');
+const rootDir = existsSync(path.join(__dirname, 'public')) ? __dirname : path.resolve(__dirname, '..');
 const dataDir = path.join(rootDir, 'data');
 const publicDir = path.join(rootDir, 'public');
 const agentProbePath = path.join(rootDir, 'agent', 'probe.sh');
@@ -24,7 +24,16 @@ const connectivityHistoryDbPath = path.join(dataDir, 'connectivity-history.sqlit
 const backgroundCacheDir = path.join(dataDir, 'background-cache');
 const MAX_SERVERS = 500;
 const MAX_PENDING_INSTALLS = 500;
-const MAX_CONNECTIVITY_CHECKS = 200;
+const MAX_CONNECTIVITY_CHECKS = 200; // compatibility bound for existing reports/configuration
+const MAX_CONNECTIVITY_SERVICES = 12;
+const flagCodes = new Set(readdirSync(path.join(publicDir, 'icons', 'flags')).filter((name) => /^[a-z]{2}\.svg$/.test(name)).map((name) => name.slice(0, 2).toUpperCase()));
+const flagDataCache = new Map();
+const serverCountryLookups = new Map();
+const countryLookupRetryAt = new Map();
+let accessLocationRefreshInFlight = null;
+let nextLocationLookupAt = 0;
+let connectivityChecksInFlight = null;
+let connectivityPrunedAt = 0;
 
 const clients = new Map();
 const agentLastReportAt = new Map();
@@ -43,7 +52,7 @@ hydrateConnectivityState();
 let stateWriteQueue = Promise.resolve();
 let configWriteQueue = Promise.resolve();
 let stateWriteTimer = null;
-let pendingStateWriteResolvers = [];
+let pendingStateWrite = null;
 const panelStartedAt = Date.now();
 const STATE_WRITE_DEBOUNCE_MS = 5000;
 const VIEWER_PRESENCE_TTL_MS = 8000;
@@ -58,8 +67,17 @@ const MAX_CONNECTIVITY_HISTORY_POINTS = clampInteger(process.env.MAX_CONNECTIVIT
 const HISTORY_SAMPLE_INTERVAL_MS = clampInteger(process.env.HISTORY_SAMPLE_INTERVAL_MS || 1000, 500, 3600000, 1000);
 const IPAPI_AUTO_CHECK_INTERVAL_MS = 60 * 1000;
 let ipApiRefreshInFlight = null;
+const ipApiServerRefreshes = new Map();
+const ipApiRefreshQueue = [];
+let ipApiActiveRefreshes = 0;
 
 const prunedAtStartup = pruneStateHistory();
+pruneAccessState();
+for (const report of Object.values(state.servers)) {
+  // Preserve the last known quality snapshot before any online peer with the
+  // same public IP refreshes the shared lookup cache.
+  if (!report.ipQualitySnapshot) report.ipQualitySnapshot = cachedServerIpQuality(report);
+}
 if (prunedAtStartup) saveStateNow().catch((err) => console.error(err));
 
 const server = http.createServer(async (req, res) => {
@@ -97,6 +115,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, { backgrounds: publicBackgrounds() });
     }
     if (req.method === 'GET' && url.pathname === '/api/overview') return sendJson(res, buildOverview());
+    if (req.method === 'GET' && url.pathname === '/api/flags') return sendJson(res, { flags: publicFlagAssets((url.searchParams.get('codes') || '').split(',').slice(0, 247)) });
     if (req.method === 'GET' && url.pathname.startsWith('/api/servers/')) {
       const id = decodeURIComponent(url.pathname.split('/').pop() || '');
       const detail = await buildServerDetail(id, {
@@ -157,6 +176,16 @@ server.listen(port, () => {
 setInterval(() => broadcast({ type: 'refresh', at: Date.now() }), 30000).unref();
 setInterval(() => runDueConnectivityChecks(), 1000).unref();
 setInterval(() => runDueIpApiRefresh(), IPAPI_AUTO_CHECK_INTERVAL_MS).unref();
+setInterval(() => { pruneAccessState(); pruneLoginAttempts(); pruneViewerPresence(); }, 60_000).unref();
+let shuttingDown = false;
+for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, async () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  server.close();
+  const forceExit = setTimeout(() => process.exit(1), 8000);
+  try { await saveStateNow(); connectivityDb.close(); clearTimeout(forceExit); process.exit(0); }
+  catch (err) { console.error(err); process.exit(1); }
+});
 runDueConnectivityChecks().catch((err) => console.error(err));
 runDueIpApiRefresh().catch((err) => console.error(err));
 
@@ -211,6 +240,10 @@ async function loadConfig() {
   if (!Array.isArray(loaded.ipWhitelist)) { loaded.ipWhitelist = []; changed = true; }
   if (loaded.ipWhitelistEnabled !== true) { loaded.ipWhitelistEnabled = false; changed = true; }
   if (!Array.isArray(loaded.connectivityChecks)) { loaded.connectivityChecks = []; changed = true; }
+  for (const check of loaded.connectivityChecks) {
+    const seconds = Math.max(5,Math.min(720,Math.ceil(Number(check.intervalSeconds || 300)/60)))*60;
+    if (check.intervalSeconds !== seconds) {check.intervalSeconds=seconds;changed=true;}
+  }
   if (!Array.isArray(loaded.pendingInstalls)) { loaded.pendingInstalls = []; changed = true; }
   if (!Array.isArray(loaded.servers)) { loaded.servers = []; changed = true; }
   if (loaded.connectivityChecks.length > MAX_CONNECTIVITY_CHECKS) { loaded.connectivityChecks = loaded.connectivityChecks.slice(0, MAX_CONNECTIVITY_CHECKS); changed = true; }
@@ -274,8 +307,9 @@ function migrateConnectivityHistory() {
   const insert = connectivityDb.prepare(`INSERT OR IGNORE INTO connectivity_history
     (server_id, check_id, checked_at, latency_ms, ok, packet_loss_percent)
     VALUES (?, ?, ?, ?, ?, ?)`);
-  const cutoff = Date.now() - 15 * 24 * 60 * 60 * 1000;
   for (const [serverId, server] of Object.entries(state.servers || {})) {
+    const referenceAt = isReportOnline(server) ? Date.now() : Number(server.lastReportAt || Date.now());
+    const cutoff = referenceAt - 15 * 24 * 60 * 60 * 1000;
     for (const item of Array.isArray(server?.connectivity) ? server.connectivity : []) {
       for (const point of Array.isArray(item?.history) ? item.history : []) {
         const t = Number(point?.t || 0);
@@ -285,7 +319,7 @@ function migrateConnectivityHistory() {
       }
     }
   }
-  connectivityDb.prepare('DELETE FROM connectivity_history WHERE checked_at < ?').run(cutoff);
+  pruneConnectivityHistory();
 }
 
 function readConnectivityHistory(serverId, checkId, cutoff) {
@@ -300,7 +334,23 @@ function appendConnectivityHistory(serverId, checkId, point) {
     (server_id, check_id, checked_at, latency_ms, ok, packet_loss_percent)
     VALUES (?, ?, ?, ?, ?, ?)`).run(serverId, checkId, point.t, point.latencyMs ?? null,
       point.ok ? 1 : 0, point.packetLossPercent);
-  connectivityDb.prepare('DELETE FROM connectivity_history WHERE checked_at < ?').run(Date.now() - 15 * 24 * 60 * 60 * 1000);
+  // Replayed agent samples are filtered before reaching SQLite. Retention is
+  // maintained hourly, rather than scanning the table on every heartbeat.
+  pruneConnectivityHistory();
+}
+
+function pruneConnectivityHistory() {
+  const now = Date.now();
+  if (connectivityPrunedAt && now - connectivityPrunedAt < 3600_000) return;
+  connectivityPrunedAt = now;
+  const remove = connectivityDb.prepare('DELETE FROM connectivity_history WHERE server_id = ? AND checked_at < ?');
+  const ids = new Set(config.servers.map((meta) => meta.id));
+  for (const { server_id: id } of connectivityDb.prepare('SELECT DISTINCT server_id FROM connectivity_history').all()) {
+    const report = state.servers[id] || {};
+    const referenceAt = isReportOnline(report) ? now : Number(report.lastReportAt || now);
+    if (!ids.has(id)) connectivityDb.prepare('DELETE FROM connectivity_history WHERE server_id = ?').run(id);
+    else remove.run(id, referenceAt - 15 * 86400_000);
+  }
 }
 
 function pruneStateHistory() {
@@ -324,9 +374,10 @@ function pruneStateHistory() {
   }
   for (const server of Object.values(state.servers || {})) {
     if (!Array.isArray(server?.connectivity)) continue;
+    const serverCutoff = (isReportOnline(server) ? now : Number(server.lastReportAt || now)) - 15 * 86400_000;
     for (const item of server.connectivity) {
       if (!Array.isArray(item?.history)) continue;
-      const next = item.history.filter((point) => Number(point?.t || 0) >= connectivityCutoff).slice(-MAX_CONNECTIVITY_HISTORY_POINTS);
+      const next = item.history.filter((point) => Number(point?.t || 0) >= serverCutoff).slice(-MAX_CONNECTIVITY_HISTORY_POINTS);
       if (next.length !== item.history.length) { item.history = next; changed = true; }
     }
   }
@@ -354,15 +405,16 @@ function persistConnectivityState() {
 }
 
 function saveStateSoon() {
-  return new Promise((resolve, reject) => {
-    pendingStateWriteResolvers.push({ resolve, reject });
-    if (stateWriteTimer) return;
+  if (pendingStateWrite) return pendingStateWrite.promise;
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  pendingStateWrite = { promise, resolve, reject };
     stateWriteTimer = setTimeout(() => {
       stateWriteTimer = null;
       flushStateWrites().catch((err) => console.error(err));
     }, STATE_WRITE_DEBOUNCE_MS);
     stateWriteTimer.unref();
-  });
+  return promise;
 }
 
 async function saveStateNow() {
@@ -374,13 +426,14 @@ async function saveStateNow() {
 }
 
 async function flushStateWrites() {
-  const waiters = pendingStateWriteResolvers.splice(0);
+  const pending = pendingStateWrite;
+  pendingStateWrite = null;
   try {
     stateWriteQueue = stateWriteQueue.catch(() => {}).then(() => writeJsonCompact(statePath, state));
     await stateWriteQueue;
-    waiters.forEach(({ resolve }) => resolve());
+    pending?.resolve();
   } catch (err) {
-    waiters.forEach(({ reject }) => reject(err));
+    pending?.reject(err);
     throw err;
   }
 }
@@ -412,7 +465,8 @@ function buildPublicBootstrapScript() {
     viewerIpModuleEnabled: config.viewerIpModuleEnabled !== false,
     panelStartedAt
   };
-  const payload = JSON.stringify({ basics, backgrounds: publicBackgrounds() }).replace(/</g, '\\u003c');
+  const flags = publicFlagAssets(config.servers.map((meta) => serverCountryCode(meta, state.servers[meta.id])));
+  const payload = JSON.stringify({ basics, backgrounds: publicBackgrounds(), flags, flagCodes: [...flagCodes] }).replace(/</g, '\\u003c');
   return `<script>window.__SPM_BOOTSTRAP__=${payload};<\/script>`;
 }
 
@@ -479,24 +533,79 @@ async function handleAgentReport(req, res) {
   }
 
   const meta = config.servers.find((server) => server.id === report.id);
+  // Authentication is tied to the stable ID/secret, never the agent's address.
+  // The authenticated connection also supplies a fresh address if discovery
+  // services are unavailable or the agent still has a pre-reboot cached IP.
+  const observedIp = clientKey(req);
+  if (net.isIP(observedIp) && !isPrivateIp(observedIp)) {
+    const family = net.isIP(observedIp) === 4 ? '4' : '6';
+    report[`publicIpv${family}`] = observedIp;
+    report[`ipv${family}`] = observedIp;
+    report.publicIp = observedIp;
+    report.ip = observedIp;
+  }
   updateTrafficCycleState(meta, state.servers[report.id], report, now);
   const mergedReport = mergeAgentReport(state.servers[report.id], report);
+  const previousReportAt = Number(state.servers[report.id]?.lastReportAt || 0);
+  const connectivityGaps = (state.servers[report.id]?.connectivityGaps || [])
+    .filter(gap => Number(gap.end) >= now - 15 * 86400_000);
+  if (previousReportAt && !isReportOnline(state.servers[report.id], now)) {
+    connectivityGaps.push({ start: previousReportAt, end: now });
+    delete state.agentConnectivityServed[report.id];
+  }
 
   state.servers[report.id] = {
     ...state.servers[report.id],
     ...mergedReport,
     firstReportAt: state.servers[report.id]?.firstReportAt || now,
+    connectivityGaps: connectivityGaps.slice(-5000),
     connectivity: Array.isArray(report.connectivity) && report.connectivity.length
       ? mergeServerConnectivity(report.id, report.connectivity)
       : (state.servers[report.id]?.connectivity || []),
     lastReportAt: now
   };
+  void refreshServerCountryIfNeeded(meta, state.servers[report.id]);
+  // First usable IP (including one discovered after startup) starts its own
+  // bounded job; it must not wait for a global refresh already in progress.
+  if (config.ipapiKey && ipApiRefreshDue(state.servers[report.id])) {
+    void refreshServerIpApiQuality(meta).catch((err) => console.error(err));
+  }
 
-  maybeAppendHistoryPoint(report.id, compactHistoryPoint(report, now), now);
-
-  saveStateSoon().catch((err) => console.error(err));
+  // Notify the UI immediately after the in-memory report is committed. Do not
+  // wait for history cleanup or state persistence before sending SSE.
   broadcast({ type: 'refresh', id: report.id, at: now });
+  maybeAppendHistoryPoint(report.id, compactHistoryPoint(report, now), now);
+  saveStateSoon().catch((err) => console.error(err));
   return sendJson(res, { ok: true, server: report.id });
+}
+
+function dueAgentConnectivityChecks(serverId, now = Date.now()) {
+  let jobs = state.agentConnectivityServed[serverId];
+  if (!jobs || typeof jobs !== 'object') jobs = state.agentConnectivityServed[serverId] = {};
+  const active = (config.connectivityChecks || []).filter(check=>check.enabled!==false);
+  for (const id of Object.keys(jobs)) if(!active.some(check=>check.id===id)) delete jobs[id];
+  const due=[];
+  for(const check of active) {
+    const intervalMs=Number(check.intervalSeconds || 300)*1000;
+    const signature=JSON.stringify([check.target,intervalMs]);
+    let job=jobs[check.id];
+    if (!job || job.signature!==signature) job=jobs[check.id]={signature,attempts:0,nextAt:0,awaiting:false};
+    if(job.awaiting && now-job.dispatchedAt<15000) continue;
+    if(!job.awaiting && now<job.nextAt) continue;
+    if(job.awaiting && job.attempts>=4) {
+      // Do not turn an offline agent into fabricated target failures.
+      if(!isReportOnline(state.servers[serverId],now)) continue;
+      state.servers[serverId].connectivity=mergeServerConnectivity(serverId,[{id:check.id,checkedAt:now,taskAt:job.slotAt,
+        attempts:1,final:true,ok:false,latencyMs:0,packetLossPercent:100,error:'no_response_after_retries'}]);
+      broadcast({type:'refresh',id:serverId,at:now});
+      continue;
+    }
+    if(!job.awaiting && !job.retry) {job.attempts=0;job.slotAt=now;}
+    job.attempts++;job.dispatchedAt=now;job.awaiting=true;job.retry=false;
+    job.nextAt=job.slotAt+intervalMs;
+    due.push({check,job});
+  }
+  return due;
 }
 
 function handleAgentConnectivity(req, res, url) {
@@ -506,17 +615,10 @@ function handleAgentConnectivity(req, res, url) {
   const pendingInstall = config.pendingInstalls.find((install) => install.id === serverId);
   if (!serverId || !isAgentAuthorized(existingMeta, pendingInstall, token)) return sendJson(res, { error: 'unauthorized' }, 401);
   const now = Date.now();
-  const checks = (config.connectivityChecks || []).filter((check) => check.enabled !== false);
-  const dueMs = (checks.length ? Math.max(5, Math.min(...checks.map((check) => Number(check.intervalSeconds || 60)))) : 60) * 1000;
-  const lastServed = Number(state.agentConnectivityServed?.[serverId] || 0);
-  const shouldServe = checks.length && now - lastServed >= dueMs;
-  if (shouldServe) {
-    state.agentConnectivityServed = { ...(state.agentConnectivityServed || {}), [serverId]: now };
-    saveState().catch((err) => console.error(err));
-  }
-  const lines = (shouldServe ? checks : [])
-    .filter((check) => check.enabled !== false)
-    .map((check) => [check.id, check.name, check.target, check.intervalSeconds || 60].map((value) => String(value || '').replace(/[\t\r\n]/g, ' ')).join('\t'));
+  const checks = dueAgentConnectivityChecks(serverId, now);
+  const lines = checks.map(({check, job}) => [check.id, check.name, check.target, check.intervalSeconds || 300,
+    5-job.attempts, job.slotAt].map(value => String(value ?? '').replace(/[\t\r\n]/g, ' ')).join('\t'));
+  void saveStateSoon().catch(err=>console.error(err));
   res.writeHead(200, corsHeaders({ 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-cache' }));
   res.end(`${lines.join('\n')}\n`);
 }
@@ -647,12 +749,12 @@ async function handleAdminSettingsGet(req, res, url = null) {
   if (section === 'all' || section === 'basic' || section === 'basics') payload.basics = adminPanelBasics();
   if (section === 'all' || section === 'images') payload.backgrounds = normalizeBackgrounds(config.backgrounds);
   if (section === 'all' || section === 'online' || section === 'whitelist') {
-    await ensureViewerAccessLocations();
+    scheduleAccessLocationRefresh();
     payload.onlineViewers = onlineViewerStats();
     payload.viewerAccess = publicViewerAccess();
   }
   if (section === 'all' || section === 'whitelist') {
-    await ensureBlockedWhitelistLocations();
+    scheduleAccessLocationRefresh();
     payload.blockedWhitelistAccess = publicBlockedWhitelistAccess();
     payload.whitelist = adminWhitelistSettings(req);
   }
@@ -661,7 +763,7 @@ async function handleAdminSettingsGet(req, res, url = null) {
 
 async function handleAdminViewersGet(req, res) {
   if (!isAdminAuthorized(req)) return sendJson(res, { error: 'unauthorized' }, 401);
-  await ensureViewerAccessLocations();
+  scheduleAccessLocationRefresh();
   return sendJson(res, {
     ok: true,
     onlineViewers: onlineViewerStats(),
@@ -671,7 +773,7 @@ async function handleAdminViewersGet(req, res) {
 
 async function handleAdminBlockedWhitelistGet(req, res) {
   if (!isAdminAuthorized(req)) return sendJson(res, { error: 'unauthorized' }, 401);
-  await ensureBlockedWhitelistLocations();
+  scheduleAccessLocationRefresh();
   return sendJson(res, {
     ok: true,
     blockedWhitelistAccess: publicBlockedWhitelistAccess()
@@ -740,7 +842,7 @@ async function handleAdminSettingsSave(req, res) {
     if (result.ipApiKeyChanged) clearIpApiCache();
     const shouldForceRelogin = Boolean(session && input.security);
     if (shouldForceRelogin) revokeAdminSessions();
-    await ensureViewerAccessLocations(); broadcast({ type: 'refresh', at: Date.now() });
+    scheduleAccessLocationRefresh(); broadcast({ type: 'refresh', at: Date.now() });
     return sendJson(res, { ok: true, forceRelogin: shouldForceRelogin, restartRequired: result.restartRequired, basics: adminPanelBasics(), backgrounds: normalizeBackgrounds(config.backgrounds), onlineViewers: onlineViewerStats(), viewerAccess: publicViewerAccess(), blockedWhitelistAccess: publicBlockedWhitelistAccess(), whitelist: adminWhitelistSettings(req) });
   } catch (err) {
     if (err?.business || /required|unsupported|newlines|must be|between|invalid URL/i.test(err?.message || '')) return sendJson(res, { error: err.code || 'invalid_settings', message: err.message }, 400);
@@ -786,6 +888,11 @@ function clearIpApiCache() {
     if (entry && Object.prototype.hasOwnProperty.call(entry, 'ipApi')) delete entry.ipApi;
   }
   state.ipApiLastRefreshAt = 0;
+  for (const report of Object.values(state.servers)) {
+    report.ipApiRefreshedAt = 0;
+    report.ipApiAttemptedAt = 0;
+    report.ipApiRefreshIps = '';
+  }
   saveState().catch((err) => console.error(err));
 }
 
@@ -795,6 +902,7 @@ async function handleAdminIpApiRefresh(req, res) {
   return sendJson(res, {
     ok: result.failed === 0,
     attempted: result.attempted,
+    skipped: result.skipped,
     success: result.success,
     failed: result.failed,
     message: ipApiRefreshResultMessage(result),
@@ -813,65 +921,123 @@ async function refreshPanelServerIpApiQuality(trigger = 'auto') {
   return ipApiRefreshInFlight;
 }
 
-async function refreshPanelServerIpApiQualityInner(trigger = 'auto') {
-  if (!String(config.ipapiKey || '').trim()) {
-    const results = orderedServers().map((meta) => ({ serverName: meta.name || meta.id, ok: false, reason: '后端未填写 IPAPI 密钥' }));
-    return { trigger, attempted: results.length, success: 0, failed: results.length, results };
+function isReportOnline(report = {}, now = Date.now()) {
+  return Boolean(report?.lastReportAt && now - Number(report.lastReportAt) <= Number(config.heartbeatTimeoutSeconds || 45) * 1000);
+}
+
+function reportIpSignature(report = {}) {
+  const { ipv4, ipv6 } = serverIpFields(report);
+  return `${ipv4}|${ipv6}`;
+}
+
+function ipApiRefreshDue(report, now = Date.now()) {
+  if (!isReportOnline(report, now)) return false;
+  const signature = reportIpSignature(report);
+  if (signature === '|') return false;
+  const interval = normalizeIpApiRefreshIntervalHours(config.ipapiRefreshIntervalHours || 24) * 3600_000;
+  const changed = report.ipApiRefreshIps !== reportIpSignature(report);
+  const lastSuccess = Number(report.ipApiRefreshedAt || 0);
+  const lastAttempt = Number(report.ipApiAttemptedAt || 0);
+  return (changed || !lastSuccess || now - lastSuccess >= interval)
+    && (report.ipApiAttemptIps !== signature || now - lastAttempt >= 60_000);
+}
+
+function refreshServerIpApiQuality(meta, refreshed = new Map()) {
+  if (ipApiServerRefreshes.has(meta.id)) return ipApiServerRefreshes.get(meta.id);
+  const task = new Promise((resolve, reject) => {
+    const job = { meta, refreshed, resolve, reject };
+    // New nodes take the next available slot before routine refreshes.
+    if (!state.servers[meta.id]?.ipApiRefreshedAt) ipApiRefreshQueue.unshift(job);
+    else ipApiRefreshQueue.push(job);
+  });
+  ipApiServerRefreshes.set(meta.id, task);
+  drainIpApiRefreshQueue();
+  return task;
+}
+
+function drainIpApiRefreshQueue() {
+  while (ipApiActiveRefreshes < 4 && ipApiRefreshQueue.length) {
+    const job = ipApiRefreshQueue.shift();
+    ipApiActiveRefreshes++;
+    const finish = () => {
+      ipApiServerRefreshes.delete(job.meta.id);
+      ipApiActiveRefreshes--;
+      drainIpApiRefreshQueue();
+    };
+    refreshServerIpApiQualityInner(job.meta, job.refreshed).then(
+      (result) => { finish(); job.resolve(result); },
+      (err) => { finish(); job.reject(err); }
+    );
   }
-  const servers = [];
-  const uniqueIps = new Set();
-  for (const meta of orderedServers()) {
-    const report = state.servers[meta.id] || {};
-    const serverName = meta.name || report.name || meta.id;
-    const ips = [
-      normalizeClientIp(report.publicIpv4 || report.ipv4 || (isIpv4(report.publicIp || report.ip) ? report.publicIp || report.ip : '')),
-      normalizeClientIp(report.publicIpv6 || report.ipv6 || (isIpv6(report.publicIp || report.ip) ? report.publicIp || report.ip : ''))
-    ].filter(Boolean);
-    servers.push({ serverId: meta.id, serverName, ips });
-    ips.forEach((ip) => uniqueIps.add(ip));
+}
+
+async function refreshServerIpApiQualityInner(meta, refreshed) {
+  const report = state.servers[meta.id];
+  if (!config.servers.some((item) => item.id === meta.id) || !isReportOnline(report) || !config.ipapiKey) return null;
+  const signature = reportIpSignature(report);
+  if (signature === '|') return { serverName: meta.name || meta.id, ok: false, reason: '等待服务器上报有效 IP' };
+  const key = config.ipapiKey;
+  report.ipApiAttemptedAt = Date.now();
+  report.ipApiAttemptIps = signature;
+  report.ipApiRefreshError = '';
+  const { ipv4, ipv6 } = serverIpFields(report);
+  const failures = [];
+  const snapshot = { ipApi: { ipv4: null, ipv6: null }, status: '', message: '' };
+  for (const [family, ip] of [['ipv4', ipv4], ['ipv6', ipv6]]) {
+    if (!ip) continue;
+    if (!isReportOnline(state.servers[meta.id]) || reportIpSignature(state.servers[meta.id]) !== signature || config.ipapiKey !== key) break;
+    const lookupKey = `${key}:${ip}`;
+    if (!refreshed.has(lookupKey)) {
+      refreshed.set(lookupKey, Promise.resolve().then(() => lookupServerIpApiQualityDetailed(ip))
+        .catch(() => ({ ok: false, reason: 'IP 质量服务暂时不可用' })));
+    }
+    const result = await refreshed.get(lookupKey);
+    if (result.ok && result.data) snapshot.ipApi[family] = result.data;
+    else failures.push(sanitizeIpApiErrorText(result.reason || '更新失败'));
+  }
+  const current = state.servers[meta.id];
+  if (!config.servers.some((item) => item.id === meta.id) || !isReportOnline(current) || reportIpSignature(current) !== signature || config.ipapiKey !== key) return null;
+  const previous = current.ipQualitySnapshot?.ipApi || {};
+  for (const [family, ip] of [['ipv4', ipv4], ['ipv6', ipv6]]) {
+    if (snapshot.ipApi[family]) state.serverIpQuality[ip] = { ipApi: snapshot.ipApi[family], updatedAt: Date.now() };
+    else if (current.ipApiRefreshIps === signature) snapshot.ipApi[family] = previous[family] || null;
+  }
+  if (snapshot.ipApi.ipv4 || snapshot.ipApi.ipv6) current.ipQualitySnapshot = snapshot;
+  const ok = failures.length === 0;
+  current.ipApiRefreshError = failures.join('；');
+  if (ok) {
+    current.ipApiRefreshedAt = Date.now();
+    current.ipApiRefreshIps = signature;
+    state.ipApiLastRefreshAt = Date.now();
+  }
+  // Publish this node immediately, even if other nodes are still querying.
+  broadcast({ type: 'refresh', id: meta.id, at: Date.now() });
+  saveStateSoon().catch((err) => console.error(err));
+  return { serverName: meta.name || meta.id, ok, reason: failures.join('；') || '更新成功' };
+}
+
+async function refreshPanelServerIpApiQualityInner(trigger = 'auto') {
+  const now = Date.now();
+  const online = orderedServers().filter((meta) => isReportOnline(state.servers[meta.id], now));
+  const skipped = config.servers.length - online.length;
+  const candidates = trigger === 'auto' ? online.filter((meta) => ipApiRefreshDue(state.servers[meta.id], now)) : online;
+  if (!String(config.ipapiKey || '').trim()) {
+    const results = candidates.map((meta) => ({ serverName: meta.name || meta.id, ok: false, reason: '后端未填写 IPAPI 密钥' }));
+    return { trigger, skipped, attempted: results.length, success: 0, failed: results.length, results };
   }
   const refreshed = new Map();
-  for (const ip of uniqueIps) {
-    const result = await lookupServerIpApiQualityDetailed(ip);
-    refreshed.set(ip, result);
-    if (result.ok && result.data) {
-      state.serverIpQuality = state.serverIpQuality || {};
-      state.serverIpQuality[ip] = { ...(state.serverIpQuality[ip] || {}), ipApi: result.data, updatedAt: Date.now() };
-    }
-  }
-  const results = servers.map((row) => {
-    if (!row.ips.length) return { serverName: row.serverName, ok: false, reason: '未发现该服务器出口IP，无法更新IPAPI数据' };
-    const failures = row.ips.map((ip) => refreshed.get(ip) || { ok: false, reason: '未执行查询' }).filter((item) => !item.ok);
-    if (!failures.length) return { serverName: row.serverName, ok: true, reason: '更新成功' };
-    return {
-      serverName: row.serverName,
-      ok: false,
-      reason: Array.from(new Set(failures.map((item) => sanitizeIpApiErrorText(item.reason || '更新失败')).filter(Boolean))).join('；') || '更新失败'
-    };
-  });
+  const results = (await Promise.all(candidates.map((meta) => refreshServerIpApiQuality(meta, refreshed)))).filter(Boolean);
   const success = results.filter((item) => item.ok).length;
-  const failed = results.filter((item) => !item.ok).length;
-  // The refresh timestamp represents a completed replacement cycle. Failed
-  // queries retain their old snapshot and must not be treated as refreshed.
-  if (!failed && success) state.ipApiLastRefreshAt = Date.now();
-  await saveStateNow();
-  broadcast({ type: 'refresh', at: Date.now() });
-  if (failed) {
-    const failureText = results
-      .filter((item) => !item.ok)
-      .map((item) => `${item.serverName || '--'}: ${item.reason || '更新失败'}`)
-      .join(' | ');
-    console.warn(`IPAPI ${trigger} refresh completed with ${failed}/${results.length} failed: ${failureText}`);
+  const failed = results.length - success;
+  if (results.length) {
+    if (success) state.ipApiLastRefreshAt = Date.now();
+    await saveStateNow();
   }
-  return { trigger, attempted: results.length, success, failed, results };
+  return { trigger, skipped, attempted: results.length, success, failed, results };
 }
 
 async function runDueIpApiRefresh() {
-  if (!config.ipapiKey) return;
-  const intervalHours = normalizeIpApiRefreshIntervalHours(config.ipapiRefreshIntervalHours || 24);
-  const intervalMs = intervalHours * 60 * 60 * 1000;
-  const last = Number(state.ipApiLastRefreshAt || 0);
-  if (last > 0 && Date.now() - last < intervalMs) return;
+  if (!config.ipapiKey || !Object.values(state.servers).some((report) => ipApiRefreshDue(report))) return;
   await refreshPanelServerIpApiQuality('auto');
 }
 
@@ -879,7 +1045,7 @@ function ipApiRefreshResultMessage(result = {}) {
   const attempted = Number(result.attempted || 0);
   const failed = Number(result.failed || 0);
   const success = Number(result.success || 0);
-  if (!attempted) return '没有可更新的服务器IPAPI数据';
+  if (!attempted) return result.skipped ? `已跳过 ${result.skipped} 台离线服务器，保留最后一次数据` : '没有可更新的服务器IPAPI数据';
   if (!failed) return `IPAPI数据全部更新成功（${success} 台服务器）`;
   return `IPAPI数据更新完成：成功 ${success} 台服务器，失败 ${failed} 台服务器`;
 }
@@ -892,18 +1058,19 @@ function handleAdminConnectivityGet(req, res) {
 async function handleAdminConnectivitySave(req, res) {
   if (!isAdminAuthorized(req)) return sendJson(res, { error: 'unauthorized' }, 401);
   const input = await readBody(req);
-  const check = normalizeConnectivityCheck(input);
+  let check;
+  try { check = normalizeConnectivityCheck(input); } catch (err) { return sendJson(res, {error:err.message}, 400); }
   try {
     await transactConfig((draft) => {
       const current = draft.connectivityChecks.find((item) => item.id === check.id);
       if (current) Object.assign(current, check);
       else {
-        if (draft.connectivityChecks.length >= MAX_CONNECTIVITY_CHECKS) throw businessError('connectivity_limit_reached', 'connectivity limit reached');
+        if (draft.connectivityChecks.length >= MAX_CONNECTIVITY_SERVICES) throw businessError('connectivity_limit_reached', 'connectivity limit reached');
         draft.connectivityChecks.push(check);
       }
     });
   } catch (err) {
-    if (err?.code === 'connectivity_limit_reached') return sendJson(res, { error: err.code }, 409);
+    if (err?.code === 'connectivity_limit_reached') return sendJson(res, { error: err.code, message: '达到数量上限' }, 409);
     throw err;
   }
   runConnectivityCheck(check).catch((err) => console.error(err));
@@ -919,6 +1086,7 @@ async function handleAdminConnectivityDelete(req, res, url) {
     draft.connectivityChecks = (draft.connectivityChecks || []).filter((check) => check.id !== id);
     return before !== draft.connectivityChecks.length;
   });
+  connectivityDb.prepare('DELETE FROM connectivity_history WHERE check_id = ?').run(id);
   connectivityResults.delete(id);
   connectivityHistory.delete(id);
   delete state.connectivityResults?.[id];
@@ -1026,6 +1194,7 @@ async function handleAdminDeleteServer(req, res, url) {
     draft.pendingInstalls = (draft.pendingInstalls || []).filter((install) => install.id !== id);
     return before !== draft.servers.length;
   });
+  connectivityDb.prepare('DELETE FROM connectivity_history WHERE server_id = ?').run(id);
   delete state.servers[id];
   delete state.history[id];
   state.deletedServerIds = state.deletedServerIds || {};
@@ -1197,6 +1366,7 @@ function buildAgentInstaller() {
     'Description=Server Probe Monitor Agent',
     'After=network-online.target',
     'Wants=network-online.target',
+    'StartLimitIntervalSec=0',
     '',
     '[Service]',
     'Type=simple',
@@ -1283,11 +1453,30 @@ function buildOverview() {
     settings: { basics: publicPanelBasics(), backgrounds: publicBackgrounds() },
     onlineViewers: onlineViewerStats(),
     totals,
-    servers: rows
+    servers: rows,
+    // The first detail view is already available when its homepage card is
+    // visible. Only bounded, recorded samples and cached quality are included;
+    // rendering a card must never depend on another network round trip.
+    detailSnapshots: Object.fromEntries(rows.map((server) => {
+      const report = state.servers[server.id] || {};
+      const endAt = server.online ? Date.now() : Number(report.lastReportAt || Date.now());
+      const recorded = (state.history[server.id] || []).slice(-500)
+        .filter((point) => point.t >= endAt - 120_000 && point.t <= endAt);
+      const history = recorded.length <= 60 ? recorded : Array.from({ length: 60 }, (_, i) => recorded[Math.round(i * (recorded.length - 1) / 59)]);
+      return [server.id, {
+        history,
+        point: report.lastReportAt ? compactHistoryPoint(report, report.lastReportAt) : null,
+        ipQuality: cachedServerIpQuality(report),
+        connectivityGaps: report.connectivityGaps || [],
+        connectivity: publicServerConnectivityChecks(server.id, report.connectivity || [], report.lastReportAt || 0)
+      }];
+    }))
   };
 }
 
 function cachedServerIpQuality(report = {}) {
+  if (!isReportOnline(report) && report.ipQualitySnapshot) return report.ipQualitySnapshot;
+  if (isReportOnline(report) && report.ipQualitySnapshot?.ipApi && report.ipApiRefreshIps === reportIpSignature(report)) return report.ipQualitySnapshot;
   if (!String(config.ipapiKey || '').trim()) {
     return { ipApi: null, status: 'missing_key', message: '后端未填写 IPAPI 密钥' };
   }
@@ -1295,7 +1484,12 @@ function cachedServerIpQuality(report = {}) {
   const ipv6 = normalizeClientIp(report.publicIpv6 || report.ipv6 || (isIpv6(report.publicIp || report.ip) ? report.publicIp || report.ip : ''));
   const cached = state.serverIpQuality || {};
   const value = (ip) => ip && cached[ip]?.ipApi ? { ...cached[ip].ipApi, updatedAt: cached[ip].updatedAt || cached[ip].ipApi.updatedAt || 0 } : null;
-  return { ipApi: { ipv4: value(ipv4), ipv6: value(ipv6) }, status: '', message: '' };
+  const ipApi = { ipv4: value(ipv4), ipv6: value(ipv6) };
+  if (ipApi.ipv4 || ipApi.ipv6) return { ipApi, status: '', message: '' };
+  if (!isReportOnline(report)) return { ipApi, status: 'offline', message: '服务器离线，保留已有数据；上线后自动查询。' };
+  if (!ipv4 && !ipv6) return { ipApi, status: 'waiting_ip', message: '等待服务器上报有效 IP，收到后立即查询。' };
+  if (report.ipApiRefreshError && report.ipApiAttemptIps === reportIpSignature(report)) return { ipApi, status: 'error', message: `${report.ipApiRefreshError}，稍后自动重试。` };
+  return { ipApi, status: 'pending', message: '正在查询 IP 质量，完成后自动显示。' };
 }
 
 async function buildServerDetail(id, options = {}) {
@@ -1307,6 +1501,7 @@ async function buildServerDetail(id, options = {}) {
   server.ipQuality = cachedServerIpQuality(report);
   return {
     server,
+    connectivityGaps: report.connectivityGaps || [],
     connectivity: await publicServerConnectivityChecks(id, report.connectivity || [], report.lastReportAt || 0, options),
     history: Array.isArray(state.history[id]) ? state.history[id].slice(-500) : [],
     point: compactHistoryPoint(report, report.lastReportAt || Date.now())
@@ -1320,6 +1515,7 @@ function normalizeServer(meta, report = {}, timeoutMs) {
     id: meta.id,
     name: meta.name || report.name || meta.id,
     location: meta.location || report.location || '',
+    countryCode: serverCountryCode(meta, report),
     tags: meta.tags || report.tags || [],
     startedAt: meta.startedAt || null,
     expiresAt: meta.expiresAt || report.expiresAt || null,
@@ -1331,6 +1527,7 @@ function normalizeServer(meta, report = {}, timeoutMs) {
     trafficCycleUnit: meta.trafficCycleUnit || 'month',
     sortOrder: normalizeServerSortOrder(meta.sortOrder),
     cycleTraffic,
+    trafficResetPaused: isExpiredOffline(meta, report),
     online: Boolean(lastReportAt && Date.now() - lastReportAt <= timeoutMs),
     lastReportAt,
     hostname: report.hostname || '',
@@ -1394,13 +1591,20 @@ function normalizeAgentReport(input) {
   report.disk = metric(input.disk, [['total',0,Number.MAX_SAFE_INTEGER],['used',0,Number.MAX_SAFE_INTEGER],['available',0,Number.MAX_SAFE_INTEGER],['percent',0,100]]);
   report.net = metric(input.net, [['inBps',0,Number.MAX_SAFE_INTEGER],['outBps',0,Number.MAX_SAFE_INTEGER],['totalIn',0,Number.MAX_SAFE_INTEGER],['totalOut',0,Number.MAX_SAFE_INTEGER]]);
   report.connections = metric(input.connections, [['tcp',0,1e7],['udp',0,1e7]]);
-  report.connectivity = Array.isArray(input.connectivity) ? input.connectivity.slice(0, MAX_CONNECTIVITY_CHECKS).map((item) => ({ id: text(item?.id,96), name: text(item?.name,128), ok: item.ok, error: text(item?.error,256), latencyMs: number(item?.latencyMs,0,3600000), packetLossPercent: number(item?.packetLossPercent,0,100), checkedAt: number(item?.checkedAt,0,Date.now()+300000) })).filter((v) => v.id) : [];
+  report.connectivity = Array.isArray(input.connectivity) ? input.connectivity.slice(0, MAX_CONNECTIVITY_CHECKS).map((item) => ({ id: text(item?.id,96), name: text(item?.name,128), taskAt:number(item?.taskAt,0,Date.now()+300000), attempts:number(item?.attempts,1,4), final:item?.final===true, ok: item.ok, error: text(item?.error,256), latencyMs: number(item?.latencyMs,0,3600000), packetLossPercent: number(item?.packetLossPercent,0,100), checkedAt: number(item?.checkedAt,0,Date.now()+300000) })).filter((v) => v.id) : [];
   report.connectivityMeta = { count: number(input.connectivityMeta?.count,0,MAX_CONNECTIVITY_CHECKS), error: text(input.connectivityMeta?.error,256) };
   return report;
 }
 
 function mergeAgentReport(previous = {}, incoming = {}) {
   const merged = { ...previous, ...incoming };
+  // Startup/DNS failures yield empty metadata, not evidence that a known
+  // country or location has disappeared. Preserve successful metadata.
+  for (const field of ['location', 'ipHostname', 'city', 'region', 'country', 'continent', 'latitude', 'longitude', 'postal', 'timezone', 'callingCode', 'currency', 'org', 'isp', 'asn', 'company', 'route', 'networkType']) {
+    if (!String(incoming[field] || '').trim()) merged[field] = previous[field] || '';
+  }
+  const country = normalizeCountryCode(incoming.country);
+  merged.country = country || previous.country || '';
   const previousIps = serverIpFields(previous);
   const incomingIps = serverIpFields(incoming);
   const ipv4 = incomingIps.ipv4 || previousIps.ipv4;
@@ -1413,7 +1617,7 @@ function mergeAgentReport(previous = {}, incoming = {}) {
 
   const incomingPublicIp = normalizeClientIp(incoming.publicIp || incoming.ip || '');
   const previousPublicIp = normalizeClientIp(previous.publicIp || previous.ip || '');
-  const publicIp = incomingPublicIp || previousPublicIp || ipv4 || ipv6;
+  const publicIp = (net.isIP(incomingPublicIp) ? incomingPublicIp : '') || ipv4 || ipv6 || (net.isIP(previousPublicIp) ? previousPublicIp : '');
   merged.publicIp = publicIp;
   merged.ip = publicIp;
   return merged;
@@ -1422,10 +1626,10 @@ function mergeAgentReport(previous = {}, incoming = {}) {
 function serverIpFields(report = {}) {
   const candidates = [report.publicIpv4, report.ipv4, report.publicIpv6, report.ipv6, report.publicIp, report.ip]
     .map((value) => normalizeClientIp(value))
-    .filter(Boolean);
+    .filter((value) => net.isIP(value));
   return {
-    ipv4: candidates.find((value) => isIpv4(value)) || '',
-    ipv6: candidates.find((value) => isIpv6(value)) || ''
+    ipv4: candidates.find((value) => net.isIP(value) === 4) || '',
+    ipv6: candidates.find((value) => net.isIP(value) === 6) || ''
   };
 }
 
@@ -1699,11 +1903,12 @@ function compactHistoryPoint(report, now) {
 
 function calculateCycleTraffic(meta, report = {}) {
   const quotaBytes = normalizeNullableNumber(meta.remainingTrafficBytes) || 0;
-  const cycle = currentTrafficCycle(meta);
+  const frozen = isExpiredOffline(meta, report);
+  const cycle = currentTrafficCycle(meta, frozen ? Number(report.lastReportAt || Date.now()) : Date.now());
   const stored = state.trafficCycles?.[meta.id];
   const cycleKey = trafficCycleKey(cycle);
 
-  if (stored && stored.cycleKey === cycleKey) {
+  if (stored && (frozen || stored.cycleKey === cycleKey)) {
     const usedIn = Math.max(0, Number(stored.usedIn || 0));
     const usedOut = Math.max(0, Number(stored.usedOut || 0));
     const usedTotal = usedIn + usedOut;
@@ -1810,13 +2015,21 @@ function calculateCycleTrafficFromHistory(meta, report = {}, cycle = currentTraf
   };
 }
 
-function currentTrafficCycle(meta) {
+function isExpiredOffline(meta, report = {}) {
+  const start = parseLocalDate(meta.startedAt);
+  const expiry = parseLocalDate(meta.expiresAt || report.expiresAt);
+  if (!start || !expiry || isReportOnline(report)) return false;
+  expiry.setHours(23, 59, 59, 999);
+  return expiry.getTime() > start.getTime() && Date.now() > expiry.getTime();
+}
+
+function currentTrafficCycle(meta, referenceAt = Date.now()) {
   const unit = normalizeTrafficCycleUnit(meta.trafficCycleUnit);
   const anchor = parseLocalDate(meta.trafficCycleStartDate);
   if (!anchor) return { unit, startAt: null, endAt: null };
   let start = new Date(anchor.getTime());
   let next = addTrafficCycle(start, unit);
-  const now = Date.now();
+  const now = referenceAt;
   while (next.getTime() <= now) {
     start = next;
     next = addTrafficCycle(start, unit);
@@ -2236,47 +2449,25 @@ function normalizeConnectivityCheck(input) {
   const id = cleanRequired(input.id || `conn-${Date.now().toString(36)}-${randomBytes(2).toString('hex')}`, 'id');
   const name = cleanTextRequired(input.name || id, 'name');
   const target = cleanTextRequired(input.target || '', 'target');
-  const interval = clampInteger(input.intervalSeconds || input.interval || 60, 5, 86400, 60);
+  const raw = input.intervalMinutes ?? (input.intervalSeconds != null ? Number(input.intervalSeconds)/60 : 5);
+  if (!/^[0-9]+$/.test(String(raw)) || Number(raw)<5 || Number(raw)>720) throw new Error('测试间隔时间只能填写5至720之间的阿拉伯整数');
+  const interval = Number(raw)*60;
   return { id, name, target, intervalSeconds: interval, type: 'tcping', enabled: input.enabled !== false };
 }
 
-function aggregateConnectivityHistory(history, cutoff, rangeDays, intervalSeconds = 60) {
-  // Keep payload and browser work nearly constant for 1/7/15 day views. Nezha
-  // serves period-shaped series rather than shipping every raw probe sample.
-  const bucketMs = rangeDays <= 1 ? 3 * 60_000 : rangeDays <= 7 ? 15 * 60_000 : 30 * 60_000;
-  const useAverage = rangeDays > 1 || Number(intervalSeconds || 60) < 180;
-  const buckets = new Map();
-  for (const point of history) {
-    const t = Number(point?.t || 0);
-    if (!Number.isFinite(t) || t < cutoff) continue;
-    const key = Math.floor(t / bucketMs) * bucketMs;
-    const bucket = buckets.get(key) || { t: key, latestAt: 0, latestLatency: null, latestOk: false, latestLoss: null, latencyTotal: 0, latencyCount: 0, lossTotal: 0, lossCount: 0 };
-    const latency = Number(point?.latencyMs);
-    if (point?.ok && Number.isFinite(latency) && latency > 0) {
-      bucket.latencyTotal += latency;
-      bucket.latencyCount += 1;
-    }
-    const loss = Number(point?.packetLossPercent);
-    if (Number.isFinite(loss)) {
-      bucket.lossTotal += loss;
-      bucket.lossCount += 1;
-    }
-    if (t >= bucket.latestAt) {
-      bucket.latestAt = t;
-      bucket.latestLatency = point?.ok && Number.isFinite(latency) && latency > 0 ? latency : null;
-      bucket.latestOk = Boolean(point?.ok && bucket.latestLatency != null);
-      bucket.latestLoss = Number.isFinite(loss) ? loss : (bucket.latestOk ? 0 : 100);
-    }
-    buckets.set(key, bucket);
+// Keep real observations at their original timestamps for every date range.
+// The legacy function name is retained for callers; no averaging or smoothing.
+function aggregateConnectivityHistory(history, cutoff) {
+  const samples = new Map();
+  for (const point of Array.isArray(history) ? history : []) {
+    const t = Number(point.lastAt || point.t || 0);
+    if (!Number.isFinite(t) || t <= 0 || t < cutoff) continue;
+    const latency = Number(point.count ? point.lastLatency : point.latencyMs);
+    const ok = Boolean((point.count ? point.lastOk : point.ok) && Number.isFinite(latency) && latency > 0);
+    samples.set(t, { t, latencyMs: ok ? latency : 0, ok,
+      packetLossPercent: point.packetLossPercent ?? (ok ? 0 : 100) });
   }
-  return [...buckets.values()].sort((a, b) => a.t - b.t).map((bucket) => ({
-    t: bucket.t,
-    latencyMs: useAverage ? (bucket.latencyCount ? bucket.latencyTotal / bucket.latencyCount : null) : bucket.latestLatency,
-    ok: useAverage ? bucket.latencyCount > 0 : bucket.latestOk,
-    packetLossPercent: useAverage
-      ? (bucket.lossCount ? bucket.lossTotal / bucket.lossCount : (bucket.latencyCount ? 0 : 100))
-      : bucket.latestLoss
-  }));
+  return [...samples.values()].sort((a, b) => a.t - b.t);
 }
 
 function publicConnectivityChecks() {
@@ -2295,11 +2486,12 @@ function publicConnectivityCheck(check) {
   return { ...safeCheck, result: connectivityResults.get(check.id) || null, history: connectivityHistory.get(check.id) || [] };
 }
 
-async function publicServerConnectivityChecks(serverId, results, serverLastReportAt = 0, options = {}) {
+function publicServerConnectivityChecks(serverId, results, serverLastReportAt = 0, options = {}) {
   const byId = new Map((Array.isArray(results) ? results : []).map((item) => [item.id, item]));
   const includeHistory = Boolean(options.includeConnectivityHistory);
   const rangeDays = clampInteger(options.connectivityRangeDays || 1, 1, 15, 1);
-  const cutoff = Date.now() - rangeDays * 24 * 60 * 60 * 1000;
+  const historyEndAt = isReportOnline({ lastReportAt: serverLastReportAt }) ? Date.now() : Number(serverLastReportAt || Date.now());
+  const cutoff = historyEndAt - rangeDays * 24 * 60 * 60 * 1000;
   return (config.connectivityChecks || []).filter((check) => check.enabled !== false).map((check) => {
     const item = byId.get(check.id) || {};
     const latency = Number(item.latencyMs ?? 0);
@@ -2308,7 +2500,7 @@ async function publicServerConnectivityChecks(serverId, results, serverLastRepor
     const packetLossPercent = normalizePacketLossPercent(item.packetLossPercent ?? item.packetLoss, item.ok ? 0 : 100);
     const historyPoints = includeHistory ? readConnectivityHistory(serverId, check.id, cutoff) : [];
     const history = includeHistory
-      ? aggregateConnectivityHistory(historyPoints, cutoff, rangeDays, check.intervalSeconds)
+      ? aggregateConnectivityHistory(historyPoints, cutoff, rangeDays, check.intervalSeconds, state.servers[serverId]?.connectivityGaps || [])
       : [];
     return {
       id: check.id,
@@ -2325,55 +2517,57 @@ async function publicServerConnectivityChecks(serverId, results, serverLastRepor
       } : null,
       history,
       hasServerResult,
+      historyEndAt,
+      paused: !isReportOnline({ lastReportAt: serverLastReportAt }),
       serverLastReportAt: Number(serverLastReportAt || 0)
     };
   });
 }
 
 function mergeServerConnectivity(serverId, results) {
-  const previous = new Map(Array.isArray(state.servers?.[serverId]?.connectivity) ? state.servers[serverId].connectivity.map((item) => [item.id, item]) : []);
-  const incoming = new Map((Array.isArray(results) ? results : []).map((item) => [item.id, item]));
-  const now = Date.now();
-  const batchTimes = (Array.isArray(results) ? results : [])
-    .map((item) => Number(item.checkedAt || 0))
-    .filter((value) => Number.isFinite(value) && value > 0);
-  const batchCheckedAt = batchTimes.length ? Math.max(...batchTimes) : now;
-  return (config.connectivityChecks || []).filter((check) => check.enabled !== false).map((check) => {
-    const item = incoming.get(check.id) || {};
-    const prior = previous.get(check.id) || {};
-    const checkedAt = batchCheckedAt;
-    const hasLatency = item.latencyMs !== undefined && item.latencyMs !== null && Number.isFinite(Number(item.latencyMs));
-    const latencyMs = hasLatency ? Math.max(0, Number(item.latencyMs)) : 0;
+  const previous = new Map((state.servers[serverId]?.connectivity || []).map((item) => [item.id, item]));
+  const incoming = new Map((results || []).map((item) => [item.id, item]));
+  return (config.connectivityChecks || []).filter((check) => check.enabled !== false).flatMap((check) => {
+    const item = incoming.get(check.id);
+    const prior = previous.get(check.id);
+    const checkedAt = Number(item?.checkedAt || 0);
+    // Missing targets and repeated/stale reports must never create synthetic
+    // timeouts or duplicate historical samples.
+    if (!item || !checkedAt || checkedAt <= Number(prior?.checkedAt || 0)) return prior ? [prior] : [];
+    const latencyMs = Number.isFinite(Number(item.latencyMs)) ? Math.max(0, Number(item.latencyMs)) : 0;
     const ok = Boolean(item.ok && latencyMs > 0);
+    const job=state.agentConnectivityServed[serverId]?.[check.id];
+    if (job && item.taskAt && Number(item.taskAt)!==job.slotAt) return prior ? [prior] : [];
+    if (job?.awaiting && !item.taskAt && checkedAt < job.dispatchedAt-5000) return prior ? [prior] : [];
+    if (job) {
+      if (!ok && !item.final && job.attempts<4) {
+        if(checkedAt<=Number(job.failedAt || 0)) return prior ? [prior] : [];
+        job.failedAt=checkedAt;job.awaiting=false;job.retry=true;job.nextAt=0;
+        return prior ? [prior] : [];
+      }
+      job.awaiting=false;job.retry=false;
+      job.nextAt=Math.max(job.nextAt,job.slotAt+Number(check.intervalSeconds || 300)*1000);
+    }
     const packetLossPercent = normalizePacketLossPercent(item.packetLossPercent ?? item.packetLoss, ok ? 0 : 100);
-    const point = { t: checkedAt, latencyMs, ok, packetLossPercent };
-    appendConnectivityHistory(serverId, check.id, point);
-    const history = [];
-    return {
-      id: check.id,
-      name: check.name,
-      ok,
-      error: item.error || (ok ? '' : 'no_response'),
-      latencyMs,
-      packetLossPercent,
-      checkedAt,
-      history
-    };
+    appendConnectivityHistory(serverId, check.id, { t: checkedAt, latencyMs, ok, packetLossPercent });
+    return [{ id: check.id, name: check.name, ok, error: item.error || (ok ? '' : 'no_response'), latencyMs, packetLossPercent, checkedAt, history: [] }];
   });
 }
 
 async function runDueConnectivityChecks() {
-  const now = Date.now();
-  for (const check of config.connectivityChecks || []) {
-    if (!check.enabled) continue;
-    const result = connectivityResults.get(check.id);
-    const dueMs = Number(check.intervalSeconds || 60) * 1000;
-    if (!result || now - Number(result.checkedAt || 0) >= dueMs) {
-      await runConnectivityCheck(check).catch((err) => {
-        setConnectivityResult(check.id, { ok: false, error: err.message, latencyMs: null, checkedAt: Date.now() });
-      });
+  if (connectivityChecksInFlight) return connectivityChecksInFlight;
+  connectivityChecksInFlight = runDueConnectivityChecksInner().finally(() => { connectivityChecksInFlight = null; });
+  return connectivityChecksInFlight;
+}
+
+async function runDueConnectivityChecksInner() {
+  const now=Date.now();
+  await Promise.all((config.connectivityChecks || []).filter(check=>check.enabled!==false).map(async check=>{
+    const result=connectivityResults.get(check.id);
+    if(!result || now-Number(result.checkedAt || 0)>=Number(check.intervalSeconds || 300)*1000) {
+      await runConnectivityCheck(check).catch(err=>console.error(err));
     }
-  }
+  }));
 }
 
 function parseTcpTarget(target) {
@@ -2385,18 +2579,32 @@ function parseTcpTarget(target) {
   return { host: text, port: 80 };
 }
 
-function runConnectivityCheck(check) {
+async function runConnectivityCheck(check) {
+  let result;
+  for(let attempt=0;attempt<4;attempt++) {
+    result=await runConnectivityCheckAttempt(check);
+    if(result.ok && result.latencyMs>0) break;
+  }
+  setConnectivityResult(check.id,result);
+  return result;
+}
+
+function runConnectivityCheckAttempt(check) {
   const { host, port } = parseTcpTarget(check.target);
-  if (!host || !Number.isFinite(port) || port < 1 || port > 65535) throw new Error('invalid target');
-  const started = Date.now();
+  if (!host || !Number.isFinite(port) || port < 1 || port > 65535) return Promise.resolve({ok:false,error:'invalid target',latencyMs:0,checkedAt:Date.now()});
+  const started = performance.now();
   return new Promise((resolve) => {
     const socket = net.createConnection({ host, port, timeout: 5000 });
+    let finished = false;
     const done = (ok, error = '') => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(deadline);
       socket.destroy();
-      const result = { ok, error, latencyMs: ok ? Date.now() - started : null, checkedAt: Date.now() };
-      setConnectivityResult(check.id, result);
+      const result = { ok, error, latencyMs: ok ? Math.max(0.01,Number((performance.now()-started).toFixed(2))) : 0, checkedAt: Date.now() };
       resolve(result);
     };
+    const deadline=setTimeout(()=>done(false,'timeout'),5000);
     socket.once('connect', () => done(true));
     socket.once('timeout', () => done(false, 'timeout'));
     socket.once('error', (err) => done(false, err.code || err.message));
@@ -2563,6 +2771,7 @@ function recordViewerAccess(req, persist = true) {
   state.viewerAccess = current
     .sort((a, b) => Number(b.lastAccessAt || 0) - Number(a.lastAccessAt || 0))
     .slice(0, 100);
+  pruneAccessState();
   if (persist) saveStateSoon().catch((err) => console.error(err));
   return state.viewerAccess.find((item) => item.ip === ip) || { ip, firstAccessAt: now, lastAccessAt: now };
 }
@@ -2575,6 +2784,7 @@ function recordBlockedWhitelistAccess(req) {
   // for every rejected asset/API request.
   if (now - Number(blockedWhitelistRecordAt.get(ip) || 0) < 60_000) return;
   blockedWhitelistRecordAt.set(ip, now);
+  while (blockedWhitelistRecordAt.size > 1000) blockedWhitelistRecordAt.delete(blockedWhitelistRecordAt.keys().next().value);
   const client = inferClientDevice(req);
   const current = normalizeViewerAccess(Array.isArray(state.blockedWhitelistAccess) ? state.blockedWhitelistAccess : []);
   const existing = current.find((item) => item.ip === ip);
@@ -2586,6 +2796,7 @@ function recordBlockedWhitelistAccess(req) {
   state.blockedWhitelistAccess = current
     .sort((a, b) => Number(b.lastAccessAt || 0) - Number(a.lastAccessAt || 0))
     .slice(0, 100);
+  pruneAccessState();
   saveState().catch((err) => console.error(err));
 }
 
@@ -2640,64 +2851,68 @@ function publicBlockedWhitelistAccess() {
     });
 }
 
-async function ensureViewerAccessLocations() {
-  const items = normalizeViewerAccess(Array.isArray(state.viewerAccess) ? state.viewerAccess : []).slice(0, 100);
-  state.viewerIpLocations = state.viewerIpLocations || {};
-  const staleBefore = Date.now() - 7 * 24 * 60 * 60 * 1000;
-  let changed = false;
-  for (const item of items) {
-    const ip = normalizeClientIp(item.ip);
-    const localLabel = ipLocalLocationLabel(ip);
-    if (localLabel) {
-      if (state.viewerIpLocations[ip]?.label !== localLabel) {
-        state.viewerIpLocations[ip] = { label: localLabel, updatedAt: Date.now() };
-        changed = true;
-      }
-      continue;
-    }
-    const cached = state.viewerIpLocations[ip];
-    if (cached?.label && (cached.source === 'ping0' || (cached.source === 'ip-api' && Number(cached.updatedAt || 0) >= staleBefore))) continue;
-    const fallback = await lookupIpLocationFallback(ip).catch(() => null);
-    if (fallback?.label) {
-      state.viewerIpLocations[ip] = fallback;
-      changed = true;
-    }
+function pruneAccessState() {
+  for (const [listKey, cacheKey] of [['viewerAccess', 'viewerIpLocations'], ['blockedWhitelistAccess', 'blockedWhitelistIpLocations']]) {
+    const list = normalizeViewerAccess(state[listKey] || []).sort((a, b) => b.lastAccessAt - a.lastAccessAt).slice(0, 100);
+    state[listKey] = list;
+    const retained = new Set(list.map((item) => item.ip));
+    for (const ip of Object.keys(state[cacheKey] || {})) if (!retained.has(ip)) delete state[cacheKey][ip];
   }
-  if (changed) saveState().catch((err) => console.error(err));
+  const now = Date.now();
+  for (const [ip, time] of blockedWhitelistRecordAt) if (now - time >= 60_000) blockedWhitelistRecordAt.delete(ip);
+  while (blockedWhitelistRecordAt.size > 1000) blockedWhitelistRecordAt.delete(blockedWhitelistRecordAt.keys().next().value);
+  for (const [token, session] of adminSessions) if (now >= session.expiresAt) adminSessions.delete(token);
+  const activeIps = new Set(Object.values(state.servers).flatMap((report) => Object.values(serverIpFields(report))));
+  for (const ip of Object.keys(state.serverIpQuality || {})) if (!activeIps.has(ip)) delete state.serverIpQuality[ip];
+  const ids = new Set(config.servers.map((meta) => meta.id));
+  for (const id of countryLookupRetryAt.keys()) if (!ids.has(id)) countryLookupRetryAt.delete(id);
+  for (const id of agentLastReportAt.keys()) if (!ids.has(id)) agentLastReportAt.delete(id);
 }
 
-async function ensureBlockedWhitelistLocations() {
-  const items = normalizeViewerAccess(Array.isArray(state.blockedWhitelistAccess) ? state.blockedWhitelistAccess : []).slice(0, 100);
-  state.blockedWhitelistIpLocations = state.blockedWhitelistIpLocations || {};
-  const staleBefore = Date.now() - 7 * 24 * 60 * 60 * 1000;
+function scheduleAccessLocationRefresh() {
+  if (accessLocationRefreshInFlight) return accessLocationRefreshInFlight;
+  // Return the cached list immediately; only one bounded background sweep may
+  // run even if many browsers repeatedly refresh the settings page.
+  accessLocationRefreshInFlight = Promise.resolve().then(refreshAccessLocations)
+    .catch((err) => console.error('Access location refresh failed:', err.message))
+    .finally(() => { accessLocationRefreshInFlight = null; });
+  return accessLocationRefreshInFlight;
+}
+
+async function refreshAccessLocations() {
+  pruneAccessState();
+  const sources = [['viewerAccess', 'viewerIpLocations'], ['blockedWhitelistAccess', 'blockedWhitelistIpLocations']];
+  const ips = new Set(sources.flatMap(([list]) => state[list].map((item) => item.ip)));
   let changed = false;
-  for (const item of items) {
-    const ip = normalizeClientIp(item.ip);
-    const localLabel = ipLocalLocationLabel(ip);
-    if (localLabel) {
-      if (state.blockedWhitelistIpLocations[ip]?.label !== localLabel) {
-        state.blockedWhitelistIpLocations[ip] = { label: localLabel, updatedAt: Date.now() };
-        changed = true;
-      }
-      continue;
+  for (const ip of ips) {
+    const now = Date.now();
+    const cached = sources.map(([, cache]) => state[cache][ip]).filter(Boolean).sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0))[0];
+    const local = ipLocalLocationLabel(ip);
+    let next = cached;
+    if (local) next = { label: local, updatedAt: now };
+    else if (!(cached?.label && now - Number(cached.updatedAt || 0) < 7 * 86400_000) && now >= Number(cached?.retryAt || 0)) {
+      const result = await lookupIpLocationFallback(ip).catch(() => null);
+      next = result || { ...cached, retryAt: Date.now() + 10 * 60_000 };
     }
-    const cached = state.blockedWhitelistIpLocations[ip];
-    if (cached?.label && Number(cached.updatedAt || 0) >= staleBefore) continue;
-    const fallback = await lookupIpLocationFallback(ip).catch(() => null);
-    if (fallback?.label) {
-      state.blockedWhitelistIpLocations[ip] = fallback;
-      changed = true;
+    if (!next || next === cached) continue;
+    for (const [list, cache] of sources) {
+      if (state[list].some((item) => item.ip === ip)) { state[cache][ip] = next; changed = true; }
     }
   }
-  if (changed) saveState().catch((err) => console.error(err));
+  if (changed) saveStateSoon().catch((err) => console.error(err));
 }
 
 async function lookupIpLocationFallback(ip) {
-  if (!net.isIP(ip)) return null;
+  if (!net.isIP(ip) || isPrivateIp(ip)) return null;
+  // At most 40 starts/minute, shared with country recovery. The queue is
+  // bounded by the retained visitor records and configured servers.
+  const startAt = Math.max(Date.now(), nextLocationLookupAt);
+  nextLocationLookupAt = startAt + 1500;
+  if (startAt > Date.now()) await new Promise((resolve) => setTimeout(resolve, startAt - Date.now()));
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 1800);
   try {
-    const fields = 'status,country,regionName,city,as,isp,org,query';
+    const fields = 'status,country,countryCode,regionName,city,as,isp,org,query';
     const response = await fetch(`http://ip-api.com/json/${encodeURIComponent(ip)}?lang=zh-CN&fields=${fields}`, { signal: controller.signal });
     if (!response.ok) return null;
     const data = await response.json();
@@ -2706,7 +2921,7 @@ async function lookupIpLocationFallback(ip) {
       .map((value) => String(value || '').trim())
       .filter(Boolean);
     const label = Array.from(new Set(parts)).join(' · ');
-    return label ? { label, source: 'ip-api', updatedAt: Date.now() } : null;
+    return label ? { label, country: normalizeCountryCode(data.countryCode), source: 'ip-api', updatedAt: Date.now() } : null;
   } finally {
     clearTimeout(timer);
   }
@@ -2996,4 +3211,52 @@ function sendNotFound(res) {
     'Set-Cookie': 'whitelist_access=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0'
   }));
   res.end('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="data:,"><title>404 Not Found</title><style>html,body{height:100%;margin:0}body{display:grid;place-items:center;font:700 clamp(2.5rem,8vw,6rem)/1.1 Arial,sans-serif;color:#111;background:#fff}</style></head><body>404 Not Found</body></html>');
+}
+
+
+function normalizeCountryCode(value) {
+  const aliases = { USA: 'US', UNITEDSTATES: 'US', UK: 'GB', UNITEDKINGDOM: 'GB', BRITAIN: 'GB', SINGAPORE: 'SG', JAPAN: 'JP', TOKYO: 'JP', HONGKONG: 'HK', CHINA: 'CN', GERMANY: 'DE', FRANCE: 'FR', INDIA: 'IN', MUMBAI: 'IN', KOREA: 'KR', TAIWAN: 'TW' };
+  const text = String(value || '').trim().replace(/[^a-z]/gi, '').toUpperCase();
+  const code = aliases[text] || text;
+  return flagCodes.has(code) ? code : '';
+}
+
+function serverCountryCode(meta = {}, report = {}) {
+  return normalizeCountryCode(report.country) || normalizeCountryCode(meta.location) || normalizeCountryCode(report.location);
+}
+
+function publicFlagAssets(codes) {
+  const flags = {};
+  for (const code of new Set(codes.map(normalizeCountryCode).filter(Boolean))) {
+    if (!flagDataCache.has(code)) {
+      const svg = readFileSync(path.join(publicDir, 'icons', 'flags', `${code.toLowerCase()}.svg`));
+      flagDataCache.set(code, `data:image/svg+xml;base64,${svg.toString('base64')}`);
+    }
+    flags[code] = flagDataCache.get(code);
+  }
+  return flags;
+}
+
+async function refreshServerCountryIfNeeded(meta, report) {
+  const { ipv4, ipv6 } = serverIpFields(report);
+  const ip = ipv4 || ipv6;
+  if (!ip || !isReportOnline(report) || serverCountryLookups.has(meta.id)) return;
+  if (normalizeCountryCode(report.country) && (!report.countryLookupIp || report.countryLookupIp === ip)) {
+    report.countryLookupIp = ip;
+    return;
+  }
+  const retry = countryLookupRetryAt.get(meta.id);
+  if (retry?.ip === ip && Date.now() < retry.at) return;
+  countryLookupRetryAt.set(meta.id, { ip, at: Date.now() + 10 * 60_000 });
+  const task = lookupIpLocationFallback(ip).then((result) => {
+    const current = state.servers[meta.id];
+    const currentIps = serverIpFields(current);
+    if (!current || !isReportOnline(current) || (currentIps.ipv4 || currentIps.ipv6) !== ip || !result?.country) return;
+    current.country = result.country;
+    current.countryLookupIp = ip;
+    saveStateSoon().catch((err) => console.error(err));
+    broadcast({ type: 'refresh', id: meta.id, at: Date.now() });
+  }).catch(() => {}).finally(() => serverCountryLookups.delete(meta.id));
+  serverCountryLookups.set(meta.id, task);
+  return task;
 }

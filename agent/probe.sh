@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-AGENT_PROBE_VERSION="20260903-shell-async-connectivity-v2"
+AGENT_PROBE_VERSION="20261105-shell-target-retry-v4"
 
 HUB_URL="${HUB_URL:-http://127.0.0.1:8080}"
 AGENT_TOKEN="${AGENT_TOKEN:-}"
@@ -9,8 +9,9 @@ SERVER_ID="${SERVER_ID:-$(hostname)}"
 SERVER_NAME="${SERVER_NAME:-$(hostname)}"
 SERVER_LOCATION="${SERVER_LOCATION:-}"
 INTERVAL="${INTERVAL:-2}"
-CONNECTIVITY_INTERVAL="${CONNECTIVITY_INTERVAL:-120}"
-STATE_DIR="${STATE_DIR:-/run/server-probe-agent}"
+CONNECTIVITY_INTERVAL=5 # task polling; target intervals are controlled by the hub
+INSTANCE_ID="$(printf '%s' "$HUB_URL" | sha256sum | cut -c1-12)"
+STATE_DIR="${STATE_DIR:-/run/server-probe-agent-${INSTANCE_ID}}"
 umask 077
 if [[ $EUID -ne 0 ]]; then
   echo "probe.sh must run as root so state stays in a root-only directory" >&2
@@ -120,7 +121,7 @@ url_encode() {
 tcp_latency_ms() {
   local host="$1" port="$2" start end
   start=$(date +%s%3N 2>/dev/null || date +%s000)
-  if timeout 2 bash -c "</dev/tcp/${host}/${port}" >/dev/null 2>&1; then
+  if timeout 2 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$port" >/dev/null 2>&1; then
     end=$(date +%s%3N 2>/dev/null || date +%s000)
     echo $((end - start))
     return 0
@@ -128,33 +129,47 @@ tcp_latency_ms() {
   return 1
 }
 
+probe_connectivity_target() {
+  local id="$1" name="$2" target="$3" attempts="$4" task_at="$5"
+  local host="$target" port=80 latency=0 ok=false error=timeout attempt packet_loss=100 result_key tmp now
+  if [[ "$target" =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then
+    host="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+  elif [[ "$target" == *:* && "$target" != *:*:* ]]; then
+    host="${target%:*}"; port="${target##*:}"
+  fi
+  [[ "$attempts" =~ ^[1-4]$ ]] || attempts=4
+  [[ "$task_at" =~ ^[0-9]+$ ]] || task_at=0
+  for ((attempt=1;attempt<=attempts;attempt++)); do
+    if latency=$(tcp_latency_ms "$host" "$port") && [[ "$latency" =~ ^[0-9]+$ ]] && ((latency>0)); then
+      ok=true; error=""; packet_loss=0; break
+    fi
+    latency=0
+  done
+  ((attempt>attempts)) && attempt=$attempts
+  now=$(date +%s%3N)
+  result_key=$(printf '%s' "$id" | sha256sum | cut -c1-32)
+  tmp=$(mktemp "$STATE_DIR/target-results/.result.XXXXXX")
+  printf '{"id":"%s","name":"%s","ok":%s,"error":"%s","latencyMs":%s,"packetLossPercent":%s,"checkedAt":%s,"taskAt":%s,"attempts":%s,"final":true}' \
+    "$(json_escape "$id")" "$(json_escape "$name")" "$ok" "$error" "$latency" "$packet_loss" "$now" "$task_at" "$attempt" > "$tmp"
+  mv -f "$tmp" "$STATE_DIR/target-results/$result_key.json"
+}
+
 connectivity_json() {
-  local first=1 now id name target interval host port latency ok error
-  now=$(date +%s)
-  fetch_connectivity_checks || true
+  local first=1 id name target interval attempts task_at file
+  install -d -m 0700 "$STATE_DIR/target-results"
+  if fetch_connectivity_checks; then
+    while IFS=$'\t' read -r id name target interval attempts task_at; do
+      [[ -n "${id:-}" && -n "${target:-}" ]] || continue
+      probe_connectivity_target "$id" "$name" "$target" "${attempts:-4}" "${task_at:-0}" &
+    done < "$CONNECTIVITY_FILE"
+    wait
+  fi
   printf '"connectivity":['
-  [[ -f "$CONNECTIVITY_FILE" ]] || { printf ']'; return; }
-  while IFS=$'\t' read -r id name target interval; do
-    [[ -n "${id:-}" && -n "${target:-}" ]] || continue
-    host="$target"; port="80"
-    if [[ "$target" =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then
-      host="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
-    elif [[ "$target" == *:* && "$target" != *:*:* ]]; then
-      host="${target%:*}"; port="${target##*:}"
-    fi
-    ok=false; error="timeout"; latency="0"
-    if latency=$(tcp_latency_ms "$host" "$port"); then
-      ok=true; error=""
-    else
-      latency="0"
-    fi
+  for file in "$STATE_DIR"/target-results/*.json; do
+    [[ -f "$file" ]] || continue
     [[ $first -eq 1 ]] || printf ','
-    first=0
-    packet_loss="0"
-    [[ "$ok" == "true" ]] || packet_loss="100"
-    printf '{"id":"%s","name":"%s","ok":%s,"error":"%s","latencyMs":%s,"packetLossPercent":%s,"checkedAt":%d}' \
-      "$(json_escape "$id")" "$(json_escape "$name")" "$ok" "$(json_escape "$error")" "$latency" "$packet_loss" "$((now * 1000))"
-  done < "$CONNECTIVITY_FILE"
+    first=0;cat "$file"
+  done
   printf ']'
 }
 
@@ -205,22 +220,29 @@ refresh_ip_meta() {
     cached_at=$(sed -nE 's/.*"cachedAt"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$IP_META_FILE" | head -n 1)
     cached_at=${cached_at:-0}
   fi
-  if (( now - cached_at < IP_META_TTL )); then
-    return 0
-  fi
+  if (( now - cached_at >= IP_META_TTL )); then
   tmp=$(mktemp "$STATE_DIR/ip.XXXXXX")
   if curl -fsS --max-time 5 https://ipinfo.io/json -o "$tmp"; then
-    sed "s/[[:space:]]*}[[:space:]]*$/,\"cachedAt\":${now}}/" "$tmp" > "$IP_META_FILE"
+    sed "s/[[:space:]]*}[[:space:]]*$/,\"cachedAt\":${now}}/" "$tmp" > "$IP_META_FILE.new"
+    mv -f "$IP_META_FILE.new" "$IP_META_FILE"
     rm -f "$tmp"
   else
     rm -f "$tmp"
   fi
-  # Public address discovery is slow on hosts without IPv6. Cache it with the
-  # metadata instead of blocking every one-second system-state report.
+  fi
+  # Address discovery runs in its own background worker every minute.
   detected_ipv4=$(fetch_public_ip https://api.ipify.org || true)
   detected_ipv6=$(fetch_public_ip https://api6.ipify.org || true)
-  [[ "$detected_ipv4" == *.* && "$detected_ipv4" != *:* ]] && printf '%s' "$detected_ipv4" > "$PUBLIC_IPV4_FILE"
-  [[ "$detected_ipv6" == *:* ]] && printf '%s' "$detected_ipv6" > "$PUBLIC_IPV6_FILE"
+  if [[ "$detected_ipv4" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    if [[ "$detected_ipv4" != "$(cat "$PUBLIC_IPV4_FILE" 2>/dev/null || true)" && -f "$IP_META_FILE" ]]; then
+      sed -E 's/"cachedAt"[[:space:]]*:[[:space:]]*[0-9]+/"cachedAt":0/' "$IP_META_FILE" > "$IP_META_FILE.new"
+      mv -f "$IP_META_FILE.new" "$IP_META_FILE"
+    fi
+    printf '%s' "$detected_ipv4" > "$PUBLIC_IPV4_FILE.new" && mv -f "$PUBLIC_IPV4_FILE.new" "$PUBLIC_IPV4_FILE"
+  fi
+  if [[ "$detected_ipv6" =~ ^[a-fA-F0-9:]+$ && "$detected_ipv6" == *:* ]]; then
+    printf '%s' "$detected_ipv6" > "$PUBLIC_IPV6_FILE.new" && mv -f "$PUBLIC_IPV6_FILE.new" "$PUBLIC_IPV6_FILE"
+  fi
   return 0
 }
 
@@ -232,9 +254,6 @@ fetch_public_ip() {
 
 ip_meta_json() {
   local public_ip public_ipv4 public_ipv6 detected_ipv4 detected_ipv6 ip_hostname city region country loc org postal timezone asn isp latitude longitude calling_code currency
-  if [[ ! -f "$IP_META_FILE" ]]; then
-    refresh_ip_meta || true
-  fi
   if [[ -f "$IP_META_FILE" ]]; then
     public_ip=$(json_value ip < "$IP_META_FILE")
     ip_hostname=$(json_value hostname < "$IP_META_FILE")
@@ -266,6 +285,7 @@ ip_meta_json() {
   fi
   public_ipv4=${PUBLIC_IPV4:-$public_ipv4}
   public_ipv6=${PUBLIC_IPV6:-$public_ipv6}
+  public_ip="${public_ipv4:-${public_ipv6:-${public_ip:-}}}"
   if [[ "${org:-}" =~ ^(AS[0-9]+)[[:space:]]+(.+)$ ]]; then
     asn="${BASH_REMATCH[1]}"
     isp="${BASH_REMATCH[2]}"
@@ -390,7 +410,10 @@ else
   # Nezha's separate RequestTask and ReportSystemState workers.
   connectivity_daemon &
   connectivity_pid=$!
-  trap 'kill "$connectivity_pid" 2>/dev/null || true' EXIT INT TERM
+  (while true; do refresh_ip_meta || true; sleep 60; done) &
+  metadata_pid=$!
+  trap 'kill "$connectivity_pid" "$metadata_pid" 2>/dev/null || true' EXIT
+  trap 'exit 0' INT TERM
   failures=0
   last_error_log=0
   while true; do
@@ -405,7 +428,7 @@ else
         echo "[$(date -Iseconds)] report failed (${failures}x)" >&2
       fi
       backoff=$(( INTERVAL * (2 ** (failures > 6 ? 6 : failures)) ))
-      (( backoff > 300 )) && backoff=300
+      (( backoff > 60 )) && backoff=60
       sleep "$backoff"
     fi
   done

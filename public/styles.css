@@ -3277,12 +3277,6 @@ body:not(.light-mode) .network-quality-tools button {
     border-bottom: 1px solid rgba(148, 163, 184, 0.42) !important;
     background: rgba(255, 255, 255, 0.18);
   }
-  .network-quality-summary-item:nth-child(3n + 1) {
-    border-right: 0 !important;
-  }
-  .network-quality-summary-item:nth-last-child(-n + 3) {
-    border-bottom: 0 !important;
-  }
   .network-quality-title-block,
   .network-quality-summary-item {
     padding: 0.65rem 0.45rem;
@@ -4207,9 +4201,6 @@ body.has-frontend-bg:not(.admin-active) .traffic-quota-track.expiry-track > span
   border-bottom: 1px solid rgba(148, 163, 184, 0.22);
 }
 
-.network-quality-summary.nezha-network-summary .network-quality-summary-item:nth-child(6n) {
-  border-right: 0;
-}
 
 .network-quality-summary.nezha-network-summary .network-quality-filter {
   min-height: 6.2rem;
@@ -4334,13 +4325,7 @@ body:not(.light-mode) .network-quality-tools .network-peak-toggle.active {
     font-size: 0.62rem !important;
   }
 
-  .network-quality-summary.nezha-network-summary .network-quality-summary-item:nth-child(6n) {
-    border-right: 1px solid rgba(148, 163, 184, 0.22);
-  }
 
-  .network-quality-summary.nezha-network-summary .network-quality-summary-item:nth-child(2n) {
-    border-right: 0;
-  }
 
   .network-quality-tools {
     display: grid;
@@ -4932,3 +4917,50 @@ body.detail-active .ip-corner-image,
     box-shadow: 0 8px 20px rgba(0, 0, 0, 0.18);
   }
 }
+
+/* Keep an accessible country label if a local SVG cannot decode. */
+.country-flag-frame { position: relative; display: block; width: 2.15rem; height: 1.52rem; flex: 0 0 auto; }
+.country-flag-label { display: none; }
+.country-flag-frame.flag-load-failed .country-flag-label { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font: 600 11px/1 sans-serif; color: #94a3b8; }
+.detail-load-status { padding: 10px 14px; margin-bottom: 12px; border-radius: 8px; background: rgba(148, 163, 184, .12); color: #64748b; font-size: 13px; }
+.detail-load-status button { margin-left: 12px; color: #3b82f6; text-decoration: underline; }
+
+/* Adaptive service headers use native cell borders, including on mobile. */
+.network-quality-summary.nezha-network-summary {
+  --network-divider: #bcc9da;
+  grid-template-columns: minmax(0, clamp(8.8rem, 18vw, 15.5rem)) minmax(0, 1fr);
+}
+.network-quality-summary.nezha-network-summary .network-quality-node-grid {
+  --network-columns: var(--network-columns-desktop, 6);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  min-width: 0;
+}
+body .network-quality-summary.nezha-network-summary .network-quality-node-grid > .network-quality-summary-item {
+  position: relative;
+  flex: 1 0 calc(100% / var(--network-columns));
+  box-sizing: border-box;
+  border: 0 !important;
+  border-right: 1px solid var(--network-divider) !important;
+  border-bottom: 1px solid var(--network-divider) !important;
+  min-width: 0;
+}
+.network-quality-summary.nezha-network-summary .network-quality-summary-item:has(.network-quality-filter.dimmed) { opacity: 1; }
+.network-quality-summary.nezha-network-summary .network-quality-filter.dimmed { opacity: 0.46; }
+.network-quality-summary.nezha-network-summary .network-quality-filter { height: 100%; }
+.network-quality-summary.nezha-network-summary .network-quality-extremes { flex-wrap: wrap; }
+body:not(.light-mode) .network-quality-summary.nezha-network-summary { --network-divider: #8091a7; }
+@media (max-width: 1100px) {
+  .network-quality-summary.nezha-network-summary { grid-template-columns: minmax(0, 1fr); }
+  .network-quality-summary.nezha-network-summary .network-quality-node-grid { --network-columns: var(--network-columns-tablet, 4); }
+  .network-quality-summary.nezha-network-summary .network-quality-title-block {
+    border-right: 0;
+    border-bottom: 1px solid var(--network-divider);
+    padding-block: 0.65rem;
+  }
+}
+@media (max-width: 720px) {
+  .network-quality-summary.nezha-network-summary .network-quality-node-grid { --network-columns: var(--network-columns-mobile, 2); }
+}
+.connectivity-sequence { font-variant-numeric: tabular-nums; }

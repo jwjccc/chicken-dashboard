@@ -9,15 +9,16 @@ const https = require('node:https');
 const { URL } = require('node:url');
 const { execFileSync } = require('node:child_process');
 
+const { performance } = require('node:perf_hooks');
 const MAX_RESPONSE_BYTES = 1024 * 1024;
-const VERSION = '20260903-node-fixed-report-v3';
+const VERSION = '20261105-target-retry-v5';
 const HUB_URL = process.env.HUB_URL || 'http://127.0.0.1:8080';
 const AGENT_TOKEN = process.env.AGENT_TOKEN || '';
 const SERVER_ID = process.env.SERVER_ID || os.hostname();
 const SERVER_NAME = process.env.SERVER_NAME || os.hostname();
 const SERVER_LOCATION = process.env.SERVER_LOCATION || '';
 const INTERVAL = clamp(Number(process.env.INTERVAL || 2), 1, 3600);
-const CONNECTIVITY_INTERVAL = clamp(Number(process.env.CONNECTIVITY_INTERVAL || 60), 5, 86400);
+const CONNECTIVITY_INTERVAL = 5; // task polling only; the hub schedules each target separately
 const IP_META_TTL = clamp(Number(process.env.IP_META_TTL || 3600), 60, 86400);
 const DISK_TTL_MS = clamp(Number(process.env.DISK_TTL_SECONDS || 30), 5, 3600) * 1000;
 const CONNECTIONS_TTL_MS = clamp(Number(process.env.CONNECTIONS_TTL_SECONDS || 2), 2, 3600) * 1000;
@@ -35,9 +36,10 @@ const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 6 });
 const metadataHttpsAgent = new https.Agent({ keepAlive: true, maxSockets: 2 });
 let prevNet = null;
 let prevCpu = null;
-let ipMeta = { data: null, fetchedAt: 0, fetching: false, publicIpv4: '', publicIpv6: '' };
+let ipMeta = { data: null, fetchedAt: 0, addressFetchedAt: 0, metadataAttemptAt: 0, fetching: false, publicIpv4: '', publicIpv6: '' };
 let connectivityRunning = false;
 let latestConnectivity = null;
+const connectivityById = new Map();
 let reportsInFlight = 0;
 const MAX_REPORTS_IN_FLIGHT = 6;
 let consecutiveFailures = 0;
@@ -54,45 +56,58 @@ function clamp(value, min, max) {
 }
 
 function request(method, path, { body, timeoutMs = 5000, headers = {} } = {}) {
+  const target = new URL(path, hub);
+  const payload = body == null ? null : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body));
+  return requestText(target, {
+    method, timeoutMs, payload,
+    agent: target.protocol === 'https:' ? httpsAgent : httpAgent,
+    headers: {
+      Authorization: `Bearer ${AGENT_TOKEN}`,
+      ...(payload ? { 'Content-Type': 'application/json', 'Content-Length': payload.length } : {}),
+      ...headers
+    }
+  });
+}
+
+function requestText(target, { method = 'GET', timeoutMs = 5000, payload = null, agent, headers = {} } = {}) {
   return new Promise((resolve, reject) => {
-    const target = new URL(path, hub);
-    const isHttps = target.protocol === 'https:';
-    const payload = body == null ? null : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body));
-    const req = (isHttps ? https : http).request({
-      protocol: target.protocol,
-      hostname: target.hostname,
-      port: target.port,
-      path: `${target.pathname}${target.search}`,
-      method,
-      agent: isHttps ? httpsAgent : httpAgent,
-      timeout: timeoutMs,
-      headers: {
-        Authorization: `Bearer ${AGENT_TOKEN}`,
-        ...(payload ? { 'Content-Type': 'application/json', 'Content-Length': payload.length } : {}),
-        ...headers
-      }
-    }, (res) => {
+    let settled = false;
+    let response;
+    let timer;
+    const finish = (err, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (err) reject(err); else resolve(value);
+    };
+    const req = (target.protocol === 'https:' ? https : http).request(target, { method, agent, headers }, (res) => {
+      response = res;
       const chunks = [];
       let received = 0;
+      res.on('error', (err) => finish(err));
+      res.on('aborted', () => finish(new Error('response aborted')));
       res.on('data', (chunk) => {
         received += chunk.length;
         if (received > MAX_RESPONSE_BYTES) {
-          res.destroy(new Error('response body too large'));
+          finish(new Error('response body too large'));
+          res.destroy(); req.destroy();
           return;
         }
         chunks.push(chunk);
       });
       res.on('end', () => {
         const text = Buffer.concat(chunks).toString('utf8');
-        if (res.statusCode >= 400) {
-          reject(new Error(`HTTP ${res.statusCode}: ${text.slice(0, 200)}`));
-          return;
-        }
-        resolve(text);
+        if (res.statusCode < 200 || res.statusCode >= 300) return finish(new Error(`HTTP ${res.statusCode}`));
+        finish(null, text);
       });
     });
-    req.on('timeout', () => req.destroy(new Error('request timeout')));
-    req.on('error', reject);
+    // A wall-clock deadline also covers DNS, pool waits and trickling response
+    // bodies. Every failure settles the promise so report slots are released.
+    timer = setTimeout(() => {
+      finish(new Error('request deadline exceeded'));
+      response?.destroy(); req.destroy();
+    }, timeoutMs);
+    req.on('error', (err) => finish(err));
     if (payload) req.write(payload);
     req.end();
   });
@@ -230,53 +245,47 @@ function uptimeSeconds() {
 }
 
 async function refreshIpMetaIfDue() {
-  if (ipMeta.fetching || Date.now() - ipMeta.fetchedAt < IP_META_TTL * 1000) return;
+  if (ipMeta.fetching || Date.now() - ipMeta.addressFetchedAt < 60_000) return;
   ipMeta.fetching = true;
+  ipMeta.addressFetchedAt = Date.now();
   try {
-    const text = await httpsGetText('https://ipinfo.io/json', 5000);
-    ipMeta.data = JSON.parse(text);
-    const detectedIp = ipMeta.data.ip || '';
-    if (detectedIp.includes(':')) ipMeta.publicIpv6 = detectedIp;
-    else if (detectedIp) ipMeta.publicIpv4 = detectedIp;
-    const [ipv4, ipv6] = await Promise.all([
+    // Address discovery is independent of geo metadata. A failed ipinfo query
+    // must not prevent IPv4/IPv6 updates for the next hour.
+    const [v4, v6] = await Promise.all([
       httpsGetText('https://api.ipify.org', 3500).catch(() => ''),
       httpsGetText('https://api6.ipify.org', 3500).catch(() => '')
     ]);
-    if (ipv4 && !ipv4.includes(':')) ipMeta.publicIpv4 = ipv4.trim();
-    if (ipv6 && ipv6.includes(':')) ipMeta.publicIpv6 = ipv6.trim();
-    ipMeta.fetchedAt = Date.now();
+    const ipv4 = net.isIP(v4) === 4 ? v4 : '';
+    const ipv6 = net.isIP(v6) === 6 ? v6 : '';
+    const changed = Boolean((ipv4 && ipv4 !== ipMeta.publicIpv4) || (ipv6 && ipv6 !== ipMeta.publicIpv6));
+    if (ipv4) ipMeta.publicIpv4 = ipv4;
+    if (ipv6) ipMeta.publicIpv6 = ipv6;
+    if (changed) ipMeta.fetchedAt = 0;
+    if (changed || !ipMeta.data || Date.now() - ipMeta.fetchedAt >= IP_META_TTL * 1000) {
+      ipMeta.metadataAttemptAt = Date.now();
+      const data = JSON.parse(await httpsGetText('https://ipinfo.io/json', 5000));
+      if (!net.isIP(data?.ip)) throw new Error('invalid IP metadata');
+      ipMeta.data = data;
+      if (net.isIP(data.ip) === 4 && !ipv4) ipMeta.publicIpv4 = data.ip;
+      if (net.isIP(data.ip) === 6 && !ipv6) ipMeta.publicIpv6 = data.ip;
+      ipMeta.fetchedAt = Date.now();
+    }
   } catch {
-    ipMeta.fetchedAt = Date.now();
+    // Keep the last successful data and retry on the next 60-second cycle.
   } finally {
     ipMeta.fetching = false;
   }
 }
 
 function httpsGetText(url, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    const req = https.get(url, { timeout: timeoutMs, agent: metadataHttpsAgent }, (res) => {
-      const chunks = [];
-      let received = 0;
-      res.on('data', (chunk) => {
-        received += chunk.length;
-        if (received > MAX_RESPONSE_BYTES) {
-          res.destroy(new Error('response body too large'));
-          return;
-        }
-        chunks.push(chunk);
-      });
-      res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8').trim()));
-    });
-    req.on('timeout', () => req.destroy(new Error('ip request timeout')));
-    req.on('error', reject);
-  });
+  return requestText(new URL(url), { timeoutMs, agent: metadataHttpsAgent }).then((text) => text.trim());
 }
 
 function ipFields() {
   const meta = ipMeta.data || {};
   const publicIpv4 = process.env.PUBLIC_IPV4 || ipMeta.publicIpv4 || '';
   const publicIpv6 = process.env.PUBLIC_IPV6 || ipMeta.publicIpv6 || '';
-  const publicIp = meta.ip || publicIpv4 || publicIpv6 || '';
+  const publicIp = publicIpv4 || publicIpv6 || (net.isIP(meta.ip) ? meta.ip : '');
   const [latitude = '', longitude = ''] = String(meta.loc || '').split(',');
   const org = meta.org || '';
   const asnMatch = org.match(/^(AS\d+)\s+(.+)$/);
@@ -295,7 +304,7 @@ function ipFields() {
 }
 
 function parseConnectivityLine(line) {
-  const [id, name, target, interval] = line.split('\t');
+  const [id, name, target, interval, attempts, taskAt] = line.split('\t');
   if (!id || !target) return null;
   let host = target;
   let port = 80;
@@ -306,22 +315,35 @@ function parseConnectivityLine(line) {
     const index = target.lastIndexOf(':');
     host = target.slice(0, index); port = Number(target.slice(index + 1));
   }
-  return { id, name, target, interval: Number(interval || CONNECTIVITY_INTERVAL), host, port };
+  return { id, name, target, interval:Number(interval || 300), maxAttempts:clamp(Number(attempts || 4),1,4), taskAt:Number(taskAt || 0), host, port };
 }
 
 function tcpLatency(check) {
-  return new Promise((resolve) => {
-    const started = Date.now();
-    const socket = net.createConnection({ host: check.host, port: check.port, timeout: 2000 });
-    const done = (ok, error = '') => {
-      socket.removeAllListeners();
-      socket.destroy();
-      resolve({ id: check.id, name: check.name, ok, error, latencyMs: ok ? Date.now() - started : 0, packetLossPercent: ok ? 0 : 100, checkedAt: Date.now() });
+  return new Promise(resolve=>{
+    const started=performance.now();let settled=false, socket;
+    const done=(ok,error='')=>{
+      if(settled)return;settled=true;clearTimeout(deadline);socket?.destroy();
+      resolve({id:check.id,name:check.name,ok,error,latencyMs:ok?Math.max(0.01,Number((performance.now()-started).toFixed(2))):0,
+        packetLossPercent:ok?0:100,checkedAt:Date.now()});
     };
-    socket.once('connect', () => done(true));
-    socket.once('timeout', () => done(false, 'timeout'));
-    socket.once('error', () => done(false, 'timeout'));
+    const deadline=setTimeout(()=>done(false,'timeout'),2000);
+    try {
+      socket=net.createConnection({host:check.host,port:check.port});
+      socket.once('connect',()=>done(true));socket.once('error',err=>done(false,err.code || 'connect_failed'));
+    } catch(err){done(false,err.message);}
   });
+}
+
+async function probeWithRetries(check) {
+  let result;
+  const limit=check.maxAttempts || 4;
+  for(let attempt=1;attempt<=limit;attempt++) {
+    try { result=await tcpLatency(check); } catch(err) {result={ok:false,error:err.message};}
+    const valid=result?.ok && Number.isFinite(result.latencyMs) && result.latencyMs>0;
+    if(valid || attempt===limit) return {...result,id:check.id,name:check.name,ok:Boolean(valid),
+      latencyMs:valid?result.latencyMs:0,packetLossPercent:valid?0:100,checkedAt:Date.now(),
+      final:true,attempts:attempt,taskAt:check.taskAt || 0};
+  }
 }
 
 async function runConnectivityChecks() {
@@ -333,10 +355,16 @@ async function runConnectivityChecks() {
     // Match Nezha's task model: probes run outside the system-state reporting
     // loop. A slow target only occupies its own promise and cannot delay the
     // next metrics report. Independent targets are probed concurrently.
-    const results = await Promise.all(checks.map(tcpLatency));
-    latestConnectivity = { connectivity: results, connectivityMeta: { count: checks.length, error: '' } };
+    await Promise.all(checks.map(async check=>{
+      const result=await probeWithRetries(check);
+      connectivityById.delete(check.id);
+      connectivityById.set(check.id,result);
+      while(connectivityById.size>200) connectivityById.delete(connectivityById.keys().next().value);
+      latestConnectivity={connectivity:[...connectivityById.values()],connectivityMeta:{count:connectivityById.size,error:''}};
+      void sendOnce().catch(()=>{});
+    }));
   } catch (err) {
-    latestConnectivity = { connectivity: [], connectivityMeta: { count: 0, error: err.message || 'fetch_failed' } };
+    // Keep unsent completed measurements for the next heartbeat retry.
   } finally {
     connectivityRunning = false;
   }
@@ -348,7 +376,7 @@ function startConnectivityDaemon() {
 }
 
 async function buildPayload() {
-  refreshIpMetaIfDue();
+  void refreshIpMetaIfDue().catch(() => {});
   const mem = readMem();
   const disk = readDisk();
   const conn = countConnections();
@@ -377,6 +405,7 @@ async function sendOnce() {
   try {
     const payload = await buildPayload();
     await request('POST', '/api/agent/report', { body: payload, timeoutMs: 5000 });
+    if (consecutiveFailures) console.info(`[${new Date().toISOString()}] reporting recovered after ${consecutiveFailures} failures`);
     consecutiveFailures = 0;
     return true;
   } catch (err) {
@@ -399,7 +428,7 @@ function nextDelaySeconds(ok) {
 }
 
 async function main() {
-  await refreshIpMetaIfDue();
+  void refreshIpMetaIfDue().catch(() => {});
   startConnectivityDaemon();
   // Fixed-rate scheduler: do not add HTTP response time to the configured
   // interval. Keep a strict concurrency cap so an unavailable hub cannot

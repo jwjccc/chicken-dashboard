@@ -95,7 +95,9 @@ WantedBy=multi-user.target
 SERVICE
 
 systemctl daemon-reload
-systemctl enable --now "$SERVICE_NAME.service"
+systemctl enable "$SERVICE_NAME.service"
+# Restart also loads updated code and unit settings when the service is active.
+systemctl restart "$SERVICE_NAME.service"
 sleep 1
 if ! systemctl is-active --quiet "$SERVICE_NAME.service"; then
   echo "Panel failed to start; recent logs:" >&2
@@ -104,11 +106,60 @@ if ! systemctl is-active --quiet "$SERVICE_NAME.service"; then
 fi
 systemctl status "$SERVICE_NAME.service" --no-pager
 
+is_login_ipv4() {
+  local address="$1" octet
+  local -a octets
+  [[ "$address" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  IFS=. read -r -a octets <<< "$address"
+  for octet in "${octets[@]}"; do
+    (( 10#$octet <= 255 )) || return 1
+  done
+  (( 10#${octets[0]} > 0 && 10#${octets[0]} < 224 && 10#${octets[0]} != 127 )) || return 1
+  [[ "${octets[0]}.${octets[1]}" != '169.254' ]]
+}
+
+is_public_login_ipv4() {
+  is_login_ipv4 "$1" || return 1
+  local -a octets
+  local first second
+  IFS=. read -r -a octets <<< "$1"
+  first=$((10#${octets[0]})); second=$((10#${octets[1]}))
+  (( first != 10 )) && ! (( first == 172 && second >= 16 && second <= 31 )) &&
+    ! (( first == 192 && second == 168 )) && ! (( first == 100 && second >= 64 && second <= 127 ))
+}
+
+detect_login_ipv4() {
+  local endpoint address candidates fallback=''
+  # IPv4-only discovery also works when the NIC has a private address behind NAT.
+  # Bypass proxy environment variables so the result is this server's egress IP.
+  if command -v curl >/dev/null 2>&1; then
+    for endpoint in https://api.ipify.org https://ipv4.icanhazip.com; do
+      address="$(curl -4 --noproxy '*' -fsS --connect-timeout 2 --max-time 3 --max-filesize 64 "$endpoint" 2>/dev/null || true)"
+      address="${address//[[:space:]]/}"
+      if is_public_login_ipv4 "$address"; then printf '%s' "$address"; return 0; fi
+    done
+  fi
+  # Prefer the default route over Docker/secondary NIC addresses if offline.
+  candidates="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src") {print $(i+1);exit}}' || true) $(hostname -I 2>/dev/null || true)"
+  for address in $candidates; do
+    if is_public_login_ipv4 "$address"; then printf '%s' "$address"; return 0; fi
+    if [[ -z "$fallback" ]] && is_login_ipv4 "$address"; then fallback="$address"; fi
+  done
+  [[ -n "$fallback" ]] || return 1
+  printf '%s' "$fallback"
+}
+
 echo
-LOCAL_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-LOCAL_IP="${LOCAL_IP:-SERVER_IP}"
 echo "Server Probe Monitor installed."
-echo "登录地址: http://${LOCAL_IP}:${PORT}"
+LOGIN_IPV4="$(detect_login_ipv4 || true)"
+if [[ -n "$LOGIN_IPV4" ]]; then
+  echo "登录地址: http://${LOGIN_IPV4}:${PORT}"
+  if ! is_public_login_ipv4 "$LOGIN_IPV4"; then
+    echo "公网 IPv4 查询未成功，以上为本机内网地址；外网访问请使用服务器公网 IPv4:${PORT}。"
+  fi
+else
+  echo "未能自动识别 IPv4，请使用服务器公网 IPv4 访问端口 ${PORT}。"
+fi
 echo "默认登录用户名/密码: admin / admin"
 echo "Change the admin username/password immediately after first login."
 echo "Optional backgrounds, connectivity checks, and basic features stay disabled until configured in the admin backend."
