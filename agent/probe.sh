@@ -10,7 +10,7 @@ SERVER_NAME="${SERVER_NAME:-$(hostname)}"
 SERVER_LOCATION="${SERVER_LOCATION:-}"
 INTERVAL="${INTERVAL:-2}"
 CONNECTIVITY_INTERVAL=5 # task polling; target intervals are controlled by the hub
-INSTANCE_ID="$(printf '%s' "$HUB_URL" | sha256sum | cut -c1-12)"
+INSTANCE_ID="${PANEL_ID:-$(printf '%s' "$HUB_URL" | sha256sum | cut -c1-12)}"
 STATE_DIR="${STATE_DIR:-/run/server-probe-agent-${INSTANCE_ID}}"
 umask 077
 if [[ $EUID -ne 0 ]]; then

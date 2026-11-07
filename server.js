@@ -1,6 +1,6 @@
 import http from 'node:http';
 import https from 'node:https';
-import { createGzip } from 'node:zlib';
+import { createGzip, gzip } from 'node:zlib';
 import net from 'node:net';
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes, scrypt, scryptSync, timingSafeEqual } from 'node:crypto';
@@ -61,7 +61,8 @@ const MAX_BODY_BYTES = 1024 * 1024;
 const MIN_AGENT_REPORT_INTERVAL_MS = clampInteger(process.env.MIN_AGENT_REPORT_INTERVAL_MS || 750, 250, 60000, 750);
 const TRUST_PROXY = /^(1|true|yes)$/i.test(String(process.env.PROBE_TRUST_PROXY || ''));
 
-const port = Number(process.env.PROBE_PORT || config.port || 8080);
+const port = process.env.PROBE_PORT === '0' ? 0 : Number(config.port || process.env.PROBE_PORT || 8080);
+let restartPending = null;
 const MAX_SERVER_HISTORY_POINTS = clampInteger(process.env.MAX_SERVER_HISTORY_POINTS || 7200, 500, 200000, 7200);
 const MAX_CONNECTIVITY_HISTORY_POINTS = clampInteger(process.env.MAX_CONNECTIVITY_HISTORY_POINTS || 5000, 100, 20000, 5000);
 const HISTORY_SAMPLE_INTERVAL_MS = clampInteger(process.env.HISTORY_SAMPLE_INTERVAL_MS || 1000, 500, 3600000, 1000);
@@ -80,7 +81,7 @@ for (const report of Object.values(state.servers)) {
 }
 if (prunedAtStartup) saveStateNow().catch((err) => console.error(err));
 
-const server = http.createServer(async (req, res) => {
+const requestHandler = async (req, res) => {
   const requestStartedAt = Date.now();
   const requestIp = normalizeClientIp(req.socket?.remoteAddress || 'unknown');
   const requestUrl = String(req.url || '/');
@@ -104,6 +105,9 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
+    const agentPath = url.pathname.startsWith('/api/agent/');
+    if (agentPath && !isAgentEndpointRequest(req)) return sendJson(res, {error:'agent_endpoint_changed'}, 410);
+    if (req.socket.localPort !== server.address()?.port && !agentPath && url.pathname !== '/healthz') return sendNotFound(res);
     // Security gate: disabled means immediate unconditional pass-through.
     // Keep this synchronous and in-memory; reading config from disk per request
     // can block the event loop and amplify refresh timeouts under load.
@@ -114,15 +118,16 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/api/backgrounds') {
       return sendJson(res, { backgrounds: publicBackgrounds() });
     }
-    if (req.method === 'GET' && url.pathname === '/api/overview') return sendJson(res, buildOverview());
+    if (req.method === 'GET' && url.pathname === '/api/overview') return await sendPublicJson(req, res, buildOverview({compact:url.searchParams.get('compact') === '1'}));
     if (req.method === 'GET' && url.pathname === '/api/flags') return sendJson(res, { flags: publicFlagAssets((url.searchParams.get('codes') || '').split(',').slice(0, 247)) });
     if (req.method === 'GET' && url.pathname.startsWith('/api/servers/')) {
       const id = decodeURIComponent(url.pathname.split('/').pop() || '');
       const detail = await buildServerDetail(id, {
         includeConnectivityHistory: url.searchParams.get('connectivityHistory') === '1',
-        connectivityRangeDays: Number(url.searchParams.get('connectivityRangeDays') || 1)
+        connectivityRangeDays: Number(url.searchParams.get('connectivityRangeDays') || 1),
+        historySince: Number(url.searchParams.get('historySince') || 0)
       });
-      return detail ? sendJson(res, detail) : sendJson(res, { error: 'server_not_found' }, 404);
+      return detail ? await sendPublicJson(req, res, detail) : sendJson(res, { error: 'server_not_found' }, 404);
     }
     if (req.method === 'GET' && url.pathname === '/api/admin/install-options') return handleInstallOptions(req, res);
     if (req.method === 'GET' && url.pathname === '/api/admin/session') return handleAdminSession(req, res);
@@ -155,7 +160,11 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/agent/report') return handleAgentReport(req, res);
     if (req.method === 'POST' && url.pathname === '/api/admin/server') return handleServerUpsert(req, res);
     if (req.method === 'GET' && url.pathname === '/api/events') return handleEvents(req, res);
-    if (req.method === 'GET' && url.pathname === '/healthz') return sendJson(res, { ok: true, now: Date.now() });
+    if (req.method === 'GET' && url.pathname === '/healthz') return sendJson(res, { ok: true, now: Date.now(), panelStartedAt, restart:restartPending });
+    if (req.method === 'GET' && url.pathname === '/api/panel-ready.svg') {
+      res.writeHead(restartPending ? 503 : 200, securityHeaders({'Content-Type':'image/svg+xml', 'Cache-Control':'no-store'}));
+      return res.end(restartPending ? '' : '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>');
+    }
 
     if (req.method === 'GET' && isAdminPagePath(url.pathname)) return serveIndex(req, res, path.join(publicDir, 'index.html'));
 
@@ -167,8 +176,11 @@ const server = http.createServer(async (req, res) => {
     if (!res.headersSent) sendJson(res, { error: 'internal_error' }, 500);
     else res.destroy();
   }
-});
-
+};
+const server = http.createServer(requestHandler);
+const configuredAgentPort = agentPortForConfig(config, port);
+const agentServer = configuredAgentPort !== port ? http.createServer(requestHandler) : null;
+if (agentServer) agentServer.listen(configuredAgentPort);
 server.listen(port, () => {
   console.log(`Server Probe Monitor listening on http://0.0.0.0:${port}`);
 });
@@ -181,6 +193,9 @@ let shuttingDown = false;
 for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, async () => {
   if (shuttingDown) return;
   shuttingDown = true;
+  broadcast({type:'restarting', ...restartNotice()});
+  revokeAdminSessions();
+  agentServer?.close();
   server.close();
   const forceExit = setTimeout(() => process.exit(1), 8000);
   try { await saveStateNow(); connectivityDb.close(); clearTimeout(forceExit); process.exit(0); }
@@ -194,7 +209,9 @@ async function loadConfig() {
   await chmod(dataDir, 0o700);
   if (!existsSync(configPath)) {
     const initial = {
-      port: 8080,
+      panelId: `pnl-${randomBytes(16).toString('hex')}`,
+      agentIdentityKeys: [],
+      port: Number(process.env.PROBE_PORT || 8080) || 8080,
       heartbeatTimeoutSeconds: 45,
       historyRetentionHours: 24,
       dashboardTitle: '服务器监控面板',
@@ -202,7 +219,7 @@ async function loadConfig() {
       ipapiKey: '',
       ipapiRefreshIntervalHours: 24,
       viewerIpModuleEnabled: false,
-      publicHubUrl: '',
+      publicHubUrl: process.env.PUBLIC_HUB_URL || '',
       agentToken: 'change-me-before-deploy',
       allowLegacyAgentToken: false,
       adminUsername: 'admin',
@@ -220,6 +237,10 @@ async function loadConfig() {
   await chmod(configPath, 0o600).catch(() => {});
   const loaded = JSON.parse(await readFile(configPath, 'utf8'));
   let changed = false;
+  if (!loaded.panelId) { loaded.panelId = `pnl-${randomBytes(16).toString('hex')}`; changed = true; }
+  if (!/^pnl-[a-f0-9]{32}$/.test(loaded.panelId)) throw new Error('invalid_panel_identity');
+  const identityKeys = rememberedAgentIdentityKeys(loaded);
+  if (JSON.stringify(loaded.agentIdentityKeys) !== JSON.stringify(identityKeys)) { loaded.agentIdentityKeys = identityKeys; changed = true; }
   if (!loaded.dashboardTitle) { loaded.dashboardTitle = '服务器监控面板'; changed = true; }
   if (loaded.dashboardIcon == null) { loaded.dashboardIcon = ''; changed = true; }
   if (loaded.ipapiKey == null) { loaded.ipapiKey = ''; changed = true; }
@@ -690,6 +711,7 @@ function handleAdminSession(req, res) {
 }
 
 async function handleAdminLogin(req, res) {
+  if (restartPending) return sendJson(res, { error: 'panel_restarting' }, 503);
   const loginKey = clientKey(req);
   pruneLoginAttempts();
   const attempt = loginAttempts.get(loginKey);
@@ -703,6 +725,7 @@ async function handleAdminLogin(req, res) {
     recordFailedLogin(loginKey);
     return sendJson(res, { error: 'invalid_credentials' }, 401);
   }
+  if (restartPending) return sendJson(res, { error: 'panel_restarting' }, 503);
   loginAttempts.delete(loginKey);
   const token = randomBytes(32).toString('hex');
   const csrfToken = randomBytes(24).toString('base64url');
@@ -780,21 +803,69 @@ async function handleAdminBlockedWhitelistGet(req, res) {
   });
 }
 
-function handleAdminRestart(req, res) {
-  if (!isAdminAuthorized(req)) return sendJson(res, { error: 'unauthorized' }, 401);
-  const serviceName = String(process.env.PROBE_PANEL_SERVICE || 'server-probe-monitor').replace(/\.service$/, '');
-  if (!/^[a-zA-Z0-9_.@:-]+$/.test(serviceName)) return sendJson(res, { error: 'invalid_service_name' }, 500);
-  if (!existsSync('/bin/systemctl') && !existsSync('/usr/bin/systemctl')) {
-    return sendJson(res, { error: 'systemctl_not_found', message: '当前环境未发现 systemctl，无法从面板内重启。' }, 500);
+
+function agentPortForConfig(settings, fallback = port) {
+  if (!settings.publicHubUrl) return fallback;
+  const url = new URL(normalizeHubUrl(settings.publicHubUrl));
+  return url.protocol === 'http:' ? Number(url.port || 80) : fallback;
+}
+
+function isAgentEndpointRequest(req) {
+  const endpoint = config.publicHubUrl ? new URL(normalizeHubUrl(config.publicHubUrl)) : null;
+  if (endpoint?.protocol === 'https:') {
+    const forwarded = TRUST_PROXY && ipLocalLocationLabel(normalizeClientIp(req.socket.remoteAddress)) &&
+      String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
+    if (!req.socket.encrypted && !forwarded) return false;
+    const host = String(forwarded ? (req.headers['x-forwarded-host'] || req.headers.host) : req.headers.host).split(',')[0];
+    try { return new URL(`https://${host}`).port === endpoint.port; } catch { return false; }
   }
-  sendJson(res, { ok: true, service: `${serviceName}.service`, message: '面板正在重启，请稍后刷新页面。' });
-  setTimeout(() => {
-    const child = spawn('systemctl', ['restart', `${serviceName}.service`], {
-      detached: true,
-      stdio: 'ignore'
+  const expected = endpoint ? Number(endpoint.port || 80) : (port === 0 ? server.address()?.port : Number(config.port));
+  return req.socket.localPort === expected;
+}
+
+function restartNotice() {
+  return {panelStartedAt, oldPanelPort:server.address()?.port || port, newPanelPort:Number(config.port || port)};
+}
+
+function performPanelRestart() {
+  const service = String(process.env.PROBE_PANEL_SERVICE || 'server-probe-monitor').replace(/\.service$/, '');
+  if (!/^[a-zA-Z0-9_.@:-]+$/.test(service)) throw new Error('invalid_service_name');
+  const child = spawn('systemctl', ['--no-block', 'restart', `${service}.service`], {stdio:'ignore'});
+  child.on('error', err => console.error('Panel restart failed:',err.message));
+  child.unref();
+}
+
+function queuePanelRestart(res) {
+  if (restartPending) return restartPending;
+  restartPending = restartNotice();
+  revokeAdminSessions();
+  broadcast({type:'restarting', ...restartPending});
+  res.once('finish', () => setTimeout(() => performPanelRestart(), 150).unref());
+  return restartPending;
+}
+
+async function checkNetworkSettings(input) {
+  const next = {...config, port: input.panelPort == null ? config.port : normalizePort(input.panelPort),
+    publicHubUrl: input.publicHubUrl == null ? config.publicHubUrl : normalizeOptionalHubUrl(input.publicHubUrl)};
+  const endpoint = next.publicHubUrl && new URL(next.publicHubUrl);
+  if (endpoint?.protocol === 'https:' && (!TRUST_PROXY || Number(endpoint.port || 443) === Number(next.port))) {
+    throw businessError('https_proxy_required','当前面板直接提供 HTTP 服务。域名/IP:端口请使用 http://；HTTPS 需要配置 TLS 反向代理并启用 PROBE_TRUST_PROXY。');
+  }
+  const owned = new Set([server.address()?.port, agentServer?.address()?.port]);
+  for (const candidate of new Set([Number(next.port), agentPortForConfig(next, Number(next.port))])) {
+    if (owned.has(candidate)) continue;
+    for (const host of ['::', '0.0.0.0']) await new Promise((resolve,reject) => {
+      const probe=net.createServer();
+      probe.once('error',err=>host === '::' && err.code === 'EAFNOSUPPORT' ? resolve() : reject(businessError('port_unavailable',`端口 ${candidate} 已被占用或无法监听，设置未保存。`)));
+      probe.listen(candidate,host,()=>probe.close(resolve));
     });
-    child.unref();
-  }, 300).unref();
+  }
+}
+
+function handleAdminRestart(req, res) {
+  if (!isAdminAuthorized(req)) return sendJson(res, {error:'unauthorized'},401);
+  const restart=queuePanelRestart(res);
+  return sendJson(res,{ok:true,restart,message:'面板正在重启，请重新登录。'});
 }
 
 async function handleAdminSettingsSave(req, res) {
@@ -802,6 +873,7 @@ async function handleAdminSettingsSave(req, res) {
   const input = await readBody(req);
   const session = getAdminSession(req);
   try {
+    if (input.basics && (input.basics.panelPort != null || input.basics.publicHubUrl != null)) await checkNetworkSettings(input.basics);
     const result = await transactConfig((draft) => {
       const previousPort = Number(draft.port || 8080);
       const previousPublicHubUrl = normalizeOptionalHubUrl(draft.publicHubUrl || '');
@@ -840,10 +912,11 @@ async function handleAdminSettingsSave(req, res) {
       return { ipApiKeyChanged, restartRequired: Number(draft.port || 8080) !== previousPort || normalizeOptionalHubUrl(draft.publicHubUrl || '') !== previousPublicHubUrl };
     });
     if (result.ipApiKeyChanged) clearIpApiCache();
-    const shouldForceRelogin = Boolean(session && input.security);
+    const shouldForceRelogin = Boolean(session && input.security) || result.restartRequired;
+    const restart = result.restartRequired ? queuePanelRestart(res) : null;
     if (shouldForceRelogin) revokeAdminSessions();
     scheduleAccessLocationRefresh(); broadcast({ type: 'refresh', at: Date.now() });
-    return sendJson(res, { ok: true, forceRelogin: shouldForceRelogin, restartRequired: result.restartRequired, basics: adminPanelBasics(), backgrounds: normalizeBackgrounds(config.backgrounds), onlineViewers: onlineViewerStats(), viewerAccess: publicViewerAccess(), blockedWhitelistAccess: publicBlockedWhitelistAccess(), whitelist: adminWhitelistSettings(req) });
+    return sendJson(res, { ok: true, forceRelogin: shouldForceRelogin, restartRequired: result.restartRequired, restart, basics: adminPanelBasics(), backgrounds: normalizeBackgrounds(config.backgrounds), onlineViewers: onlineViewerStats(), viewerAccess: publicViewerAccess(), blockedWhitelistAccess: publicBlockedWhitelistAccess(), whitelist: adminWhitelistSettings(req) });
   } catch (err) {
     if (err?.business || /required|unsupported|newlines|must be|between|invalid URL/i.test(err?.message || '')) return sendJson(res, { error: err.code || 'invalid_settings', message: err.message }, 400);
     throw err;
@@ -858,7 +931,9 @@ async function transactConfig(change) {
     // This callback and atomic write are deliberately synchronous. Credential
     // changes are rare and the short event-loop pause prevents any legacy
     // direct config mutation from interleaving and being overwritten.
+    const previousIdentityKeys = rememberedAgentIdentityKeys(draft);
     const result = change(draft);
+    draft.agentIdentityKeys = rememberedAgentIdentityKeys({...draft, agentIdentityKeys:previousIdentityKeys});
     writeJsonSync(configPath, draft);
     config = draft;
     normalizedWhitelistCache = { source: null, items: [] };
@@ -1137,7 +1212,7 @@ async function handleAdminAddServer(req, res) {
   return sendJson(res, {
     ok: true,
     install: { id: install.id, expiresAt: install.expiresAt },
-    command: buildInstallCommand({ hubUrl, token: secret, serverId, serverName: serverId, serverLocation: '', interval })
+    command: buildInstallCommand({ hubUrl, token: secret, serverId, serverName: serverId, serverLocation: '', interval, reuseExisting:true })
   });
 }
 
@@ -1269,171 +1344,44 @@ async function handleInstallCommand(req, res) {
   });
 }
 
-function buildInstallCommand({ hubUrl, token, serverId, serverName, serverLocation, interval }) {
-  return `curl -L ${shellQuote(`${hubUrl}/api/agent/install.sh`)} -o agent.sh && chmod +x agent.sh && env PROBE_HUB_URL=${shellQuote(hubUrl)} PROBE_AGENT_TOKEN=${shellQuote(token)} PROBE_SERVER_ID=${shellQuote(serverId)} PROBE_SERVER_NAME=${shellQuote(serverName)} PROBE_SERVER_LOCATION=${shellQuote(serverLocation)} PROBE_INTERVAL=${shellQuote(String(interval))} PROBE_CONNECTIVITY_INTERVAL=60 ./agent.sh`;
+function agentIdentityKey(serverId, token) {
+  return createHash('sha256').update(`${serverId}\n${token}`).digest('hex');
+}
+
+function activeAgentIdentityKeys(settings = config) {
+  return (settings.servers || []).flatMap(server => {
+    const token = server.secret || (settings.allowLegacyAgentToken === true ? settings.agentToken : '');
+    return token ? [agentIdentityKey(server.id, token)] : [];
+  });
+}
+
+function rememberedAgentIdentityKeys(settings) {
+  const current = [...activeAgentIdentityKeys(settings),
+    ...(settings.pendingInstalls || []).filter(item => item.secret).map(item => agentIdentityKey(item.id, item.secret))];
+  const keys = [...(Array.isArray(settings.agentIdentityKeys) ? settings.agentIdentityKeys : []).filter(key => !current.includes(key)), ...current];
+  return [...new Set(keys.filter(key => /^[a-f0-9]{64}$/.test(key)))].slice(-4096);
+}
+
+function buildInstallCommand({ hubUrl, token, serverId, serverName, serverLocation, interval, reuseExisting = false }) {
+  return `curl -fL ${shellQuote(`${hubUrl}/api/agent/install.sh`)} -o agent.sh && chmod +x agent.sh && env PROBE_PANEL_ID=${shellQuote(config.panelId)} PROBE_REUSE_EXISTING=${reuseExisting ? '1' : '0'} PROBE_HUB_URL=${shellQuote(hubUrl)} PROBE_AGENT_TOKEN=${shellQuote(token)} PROBE_SERVER_ID=${shellQuote(serverId)} PROBE_SERVER_NAME=${shellQuote(serverName)} PROBE_SERVER_LOCATION=${shellQuote(serverLocation)} PROBE_INTERVAL=${shellQuote(String(interval))} PROBE_CONNECTIVITY_INTERVAL=60 ./agent.sh`;
 }
 
 function buildUninstallCommand({ hubUrl }) {
-  return `curl -L ${shellQuote(`${hubUrl}/api/agent/uninstall.sh`)} -o uninstall-agent.sh && chmod +x uninstall-agent.sh && env PROBE_HUB_URL=${shellQuote(hubUrl)} ./uninstall-agent.sh`;
+  return `curl -fL ${shellQuote(`${hubUrl}/api/agent/uninstall.sh`)} -o uninstall-agent.sh && chmod +x uninstall-agent.sh && env PROBE_PANEL_ID=${shellQuote(config.panelId)} ./uninstall-agent.sh`;
 }
 
-function buildAgentInstaller() {
-  return [
-    '#!/usr/bin/env bash',
-    'set -euo pipefail',
-    '',
-    'HUB_URL="${PROBE_HUB_URL:-${HUB_URL:-}}"',
-    'AGENT_TOKEN="${PROBE_AGENT_TOKEN:-${AGENT_TOKEN:-}}"',
-    'SERVER_ID="${PROBE_SERVER_ID:-${SERVER_ID:-$(hostname)}}"',
-    'SERVER_NAME="${PROBE_SERVER_NAME:-${SERVER_NAME:-$(hostname)}}"',
-    'SERVER_LOCATION="${PROBE_SERVER_LOCATION:-${SERVER_LOCATION:-}}"',
-    'INTERVAL="${PROBE_INTERVAL:-${INTERVAL:-2}}"',
-    'CONNECTIVITY_INTERVAL="${PROBE_CONNECTIVITY_INTERVAL:-${CONNECTIVITY_INTERVAL:-60}}"',
-    'INSTANCE_ID="$(printf \'%s\' "$HUB_URL" | sha256sum | cut -c1-12)"',
-    'INSTALL_DIR="/opt/server-probe-agent-${INSTANCE_ID}"',
-    'SERVICE_NAME="server-probe-agent-${INSTANCE_ID}.service"',
-    'SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"',
-    'ENV_FILE="/etc/${SERVICE_NAME}.env"',
-    '',
-    'if [[ -z "$HUB_URL" ]]; then',
-    '  echo "PROBE_HUB_URL is required" >&2',
-    '  exit 1',
-    'fi',
-    '',
-    'if [[ -z "$AGENT_TOKEN" ]]; then',
-    '  echo "PROBE_AGENT_TOKEN is required" >&2',
-    '  exit 1',
-    'fi',
-    '',
-    '# Migrate the legacy fixed-name agent only when it belongs to this panel.',
-    'if [[ -f /etc/server-probe-agent.env ]]; then',
-    '  OLD_HUB_URL="$(bash -c \'source /etc/server-probe-agent.env 2>/dev/null; printf %s "${HUB_URL:-}"\' || true)"',
-    '  if [[ "$OLD_HUB_URL" == "$HUB_URL" ]]; then',
-    '    systemctl disable --now server-probe-agent.service 2>/dev/null || true',
-    '    rm -f /etc/systemd/system/server-probe-agent.service /etc/server-probe-agent.env',
-    '    rm -rf /opt/server-probe-agent',
-    '  fi',
-    'fi',
-    '',
-    'for value in "$HUB_URL" "$AGENT_TOKEN" "$SERVER_ID" "$SERVER_NAME" "$SERVER_LOCATION"; do [[ "$value" != *$\'\n\'* && "$value" != *$\'\r\'* ]] || { echo "Values must not contain newlines" >&2; exit 1; }; done',
-    '',
-    'if [[ $EUID -ne 0 ]]; then',
-    '  if command -v sudo >/dev/null 2>&1; then',
-    '    exec sudo -E env \\',
-    '      PROBE_HUB_URL="$HUB_URL" \\',
-    '      PROBE_AGENT_TOKEN="$AGENT_TOKEN" \\',
-    '      PROBE_SERVER_ID="$SERVER_ID" \\',
-    '      PROBE_SERVER_NAME="$SERVER_NAME" \\',
-    '      PROBE_SERVER_LOCATION="$SERVER_LOCATION" \\',
-    '      PROBE_INTERVAL="$INTERVAL" \\',
-    '      PROBE_CONNECTIVITY_INTERVAL="$CONNECTIVITY_INTERVAL" \\',
-    '      PROBE_INSTALL_DIR="$INSTALL_DIR" \\',
-    '      "$0" "$@"',
-    '  fi',
-    '  echo "Please run as root, or install sudo." >&2',
-    '  exit 1',
-    'fi',
-    '',
-    '# Prefer the persistent Node worker. The Shell fallback forks many system',
-    '# utilities per sample and can be several seconds slower on tiny VPSes.',
-    'if ! command -v node >/dev/null 2>&1; then',
-    '  if command -v apt-get >/dev/null 2>&1; then',
-    '    export DEBIAN_FRONTEND=noninteractive',
-    '    apt-get update && apt-get install -y nodejs',
-    '  elif command -v apk >/dev/null 2>&1; then',
-    '    apk add --no-cache nodejs',
-    '  elif command -v dnf >/dev/null 2>&1; then',
-    '    dnf install -y nodejs',
-    '  elif command -v yum >/dev/null 2>&1; then',
-    '    yum install -y nodejs',
-    '  fi',
-    'fi',
-    '',
-    'umask 077',
-    'tmp_dir=$(mktemp -d /opt/.server-probe-agent.install.XXXXXX)',
-    "trap 'rm -rf -- \"$tmp_dir\"' EXIT",
-    'install -d -m 0755 "$INSTALL_DIR"',
-    'curl --fail --silent --show-error --connect-timeout 10 --max-time 60 "$HUB_URL/api/agent/probe.sh" -o "$tmp_dir/probe.sh"',
-    'curl --fail --silent --show-error --connect-timeout 10 --max-time 60 "$HUB_URL/api/agent/probe-node.cjs" -o "$tmp_dir/probe-node.cjs"',
-    'install -m 0755 "$tmp_dir/probe.sh" "$INSTALL_DIR/probe.sh.new" && mv -f "$INSTALL_DIR/probe.sh.new" "$INSTALL_DIR/probe.sh"',
-    'install -m 0755 "$tmp_dir/probe-node.cjs" "$INSTALL_DIR/probe-node.cjs.new" && mv -f "$INSTALL_DIR/probe-node.cjs.new" "$INSTALL_DIR/probe-node.cjs"',
-    'rm -f "$INSTALL_DIR/probe-node.js"',
-    '{ printf "HUB_URL=%q\\nAGENT_TOKEN=%q\\nSERVER_ID=%q\\nSERVER_NAME=%q\\nSERVER_LOCATION=%q\\nINTERVAL=%q\\nCONNECTIVITY_INTERVAL=%q\\n" "$HUB_URL" "$AGENT_TOKEN" "$SERVER_ID" "$SERVER_NAME" "$SERVER_LOCATION" "$INTERVAL" "$CONNECTIVITY_INTERVAL"; } > "$ENV_FILE.new"',
-    'chmod 0600 "$ENV_FILE.new" && mv -f "$ENV_FILE.new" "$ENV_FILE"',
-    '',
-    'cat > "$SERVICE_FILE.new" <<SERVICE',
-    '[Unit]',
-    'Description=Server Probe Monitor Agent',
-    'After=network-online.target',
-    'Wants=network-online.target',
-    'StartLimitIntervalSec=0',
-    '',
-    '[Service]',
-    'Type=simple',
-    'EnvironmentFile=$ENV_FILE',
-    'Environment="CONNECTIONS_TTL_SECONDS=2"',
-    'Environment="NODE_OPTIONS=--max-old-space-size=48 --max-semi-space-size=2"',
-    'ExecStart=/bin/sh -c \'if command -v node >/dev/null 2>&1 && [ -f "$INSTALL_DIR/probe-node.cjs" ]; then exec node "$INSTALL_DIR/probe-node.cjs"; else exec "$INSTALL_DIR/probe.sh"; fi\'',
-    'Restart=always',
-    'RestartSec=5',
-    '',
-    '[Install]',
-    'WantedBy=multi-user.target',
-    'SERVICE',
-    'chmod 0644 "$SERVICE_FILE.new" && mv -f "$SERVICE_FILE.new" "$SERVICE_FILE"',
-    '',
-    '# Stop only this panel instance; agents connected to other panels keep running.',
-    'systemctl stop "$SERVICE_NAME" 2>/dev/null || true',
-    '# Clean up only this instance before starting exactly one process.',
-    'pkill -f "^node $INSTALL_DIR/probe-node\\.(cjs|js)$" 2>/dev/null || true',
-    'pkill -f "^(bash|/bin/bash|sh|/bin/sh) $INSTALL_DIR/probe\\.sh$" 2>/dev/null || true',
-    'systemctl daemon-reload',
-    'systemctl enable "$SERVICE_NAME"',
-    'systemctl restart "$SERVICE_NAME"',
-    'systemctl status "$SERVICE_NAME" --no-pager',
-    ''
-  ].join('\n');
+function buildAgentManager(action) {
+  return ['#!/usr/bin/env bash', `PANEL_ID=${shellQuote(config.panelId)}`,
+    `MATCH_KEYS=${shellQuote(rememberedAgentIdentityKeys(config).join(' '))}`,
+    `ACTIVE_KEYS=${shellQuote(activeAgentIdentityKeys().join(' '))}`,
+    `AGENT_ACTION=${shellQuote(action)}`,
+    readFileSync(path.join(rootDir, 'agent/manage-agent.sh'), 'utf8')].join('\n');
 }
 
-function buildAgentUninstaller() {
-  return [
-    '#!/usr/bin/env bash',
-    'set -euo pipefail',
-    '',
-    'HUB_URL="${PROBE_HUB_URL:-${HUB_URL:-}}"',
-    '[[ -n "$HUB_URL" ]] || { echo "PROBE_HUB_URL is required" >&2; exit 1; }',
-    "INSTANCE_ID=\"$(printf '%s' \"$HUB_URL\" | sha256sum | cut -c1-12)\"",
-    'SERVICE_NAME="server-probe-agent-${INSTANCE_ID}.service"',
-    'INSTALL_DIR="/opt/server-probe-agent-${INSTANCE_ID}"',
-    'ENV_FILE="/etc/${SERVICE_NAME}.env"',
-    'SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME"',
-    '',
-    'if [[ $EUID -ne 0 ]]; then',
-    '  if command -v sudo >/dev/null 2>&1; then',
-    '    exec sudo -E env PROBE_HUB_URL="$HUB_URL" "$0" "$@"',
-    '  fi',
-    '  echo "Please run as root, or install sudo." >&2',
-    '  exit 1',
-    'fi',
-    '',
-    'if command -v systemctl >/dev/null 2>&1; then',
-    '  systemctl stop "$SERVICE_NAME" 2>/dev/null || true',
-    '  systemctl disable "$SERVICE_NAME" 2>/dev/null || true',
-    'fi',
-    'pkill -f "$INSTALL_DIR/probe-node.cjs" 2>/dev/null || true',
-    'pkill -f "$INSTALL_DIR/probe.sh" 2>/dev/null || true',
-    'rm -f "$SERVICE_FILE" "$ENV_FILE"',
-    'rm -rf "$INSTALL_DIR"',
-    'if command -v systemctl >/dev/null 2>&1; then',
-    '  systemctl daemon-reload',
-    '  systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true',
-    'fi',
-    'echo "This panel agent instance has been uninstalled; other panel agents were not changed."',
-    ''
-  ].join('\n');
-}
+function buildAgentInstaller() { return buildAgentManager('install'); }
+function buildAgentUninstaller() { return buildAgentManager('uninstall'); }
 
-function buildOverview() {
+function buildOverview({compact = false} = {}) {
   const timeoutMs = Number(config.heartbeatTimeoutSeconds || 45) * 1000;
   const rows = orderedServers().map((meta) => normalizeServer(meta, state.servers[meta.id], timeoutMs));
   const totals = rows.reduce((acc, server) => {
@@ -1450,6 +1398,7 @@ function buildOverview() {
   return {
     title: config.dashboardTitle || '服务器监控面板',
     generatedAt: Date.now(),
+    panelStartedAt, compact,
     settings: { basics: publicPanelBasics(), backgrounds: publicBackgrounds() },
     onlineViewers: onlineViewerStats(),
     totals,
@@ -1460,14 +1409,12 @@ function buildOverview() {
     detailSnapshots: Object.fromEntries(rows.map((server) => {
       const report = state.servers[server.id] || {};
       const endAt = server.online ? Date.now() : Number(report.lastReportAt || Date.now());
-      const recorded = (state.history[server.id] || []).slice(-500)
+      const recorded = (compact ? [] : (state.history[server.id] || []).slice(-500))
         .filter((point) => point.t >= endAt - 120_000 && point.t <= endAt);
       const history = recorded.length <= 60 ? recorded : Array.from({ length: 60 }, (_, i) => recorded[Math.round(i * (recorded.length - 1) / 59)]);
       return [server.id, {
-        history,
+        ...(compact ? {} : {history, ipQuality:cachedServerIpQuality(report), connectivityGaps:report.connectivityGaps || []}),
         point: report.lastReportAt ? compactHistoryPoint(report, report.lastReportAt) : null,
-        ipQuality: cachedServerIpQuality(report),
-        connectivityGaps: report.connectivityGaps || [],
         connectivity: publicServerConnectivityChecks(server.id, report.connectivity || [], report.lastReportAt || 0)
       }];
     }))
@@ -1499,11 +1446,19 @@ async function buildServerDetail(id, options = {}) {
   const report = state.servers[id] || {};
   const server = normalizeServer(meta, report, timeoutMs);
   server.ipQuality = cachedServerIpQuality(report);
+  const retainedHistory = Array.isArray(state.history[id]) ? state.history[id].slice(-500) : [];
+  const historySince = Number(options.historySince || 0);
+  // Only a cursor still present in this server's retained history is valid.
+  // A lost/reset/expired cursor receives a complete snapshot for recovery.
+  const incremental = historySince > 0 && retainedHistory.some(point => Number(point.t) === historySince);
   return {
     server,
     connectivityGaps: report.connectivityGaps || [],
     connectivity: await publicServerConnectivityChecks(id, report.connectivity || [], report.lastReportAt || 0, options),
-    history: Array.isArray(state.history[id]) ? state.history[id].slice(-500) : [],
+    history: incremental ? retainedHistory.filter(point => Number(point.t) > historySince) : retainedHistory,
+    historyMode: incremental ? 'incremental' : 'full',
+    historyCursor: Number(retainedHistory.at(-1)?.t || 0),
+    historyStartAt: Number(retainedHistory[0]?.t || 0),
     point: compactHistoryPoint(report, report.lastReportAt || Date.now())
   };
 }
@@ -2064,7 +2019,7 @@ function handleEvents(req, res) {
     Connection: 'keep-alive'
   }));
   clients.set(res, { ip, viewerId, connectedAt: Date.now() });
-  res.write(`data: ${JSON.stringify({ type: 'hello', at: Date.now(), onlineViewers: onlineViewerStats(), viewer })}\n\n`);
+  res.write(`data: ${JSON.stringify({ type: 'hello', at: Date.now(), panelStartedAt, restart:restartPending, onlineViewers: onlineViewerStats(), viewer })}\n\n`);
   broadcast({ type: 'presence', at: Date.now(), onlineViewers: onlineViewerStats() });
   req.on('close', () => {
     clients.delete(res);
@@ -2087,8 +2042,30 @@ function broadcast(payload) {
 }
 
 function sendJson(res, data, status = 200, headers = {}) {
-  res.writeHead(status, corsHeaders({ 'Content-Type': 'application/json; charset=utf-8', ...headers }));
+  res.writeHead(status, corsHeaders({ 'Cache-Control':'no-store', 'Content-Type': 'application/json; charset=utf-8', ...headers }));
   res.end(JSON.stringify(data));
+}
+
+async function sendPublicJson(req, res, data) {
+  let body = Buffer.from(JSON.stringify(data));
+  const headers = { 'Cache-Control': 'no-store', 'Content-Type': 'application/json; charset=utf-8', Vary: 'Accept-Encoding' };
+  const acceptsGzip = String(req.headers['accept-encoding'] || '').split(',').some(entry => {
+    const [coding, ...parameters] = entry.trim().toLowerCase().split(';');
+    const quality = parameters.find(parameter => parameter.trim().startsWith('q='));
+    return coding === 'gzip' && (quality == null || Number(quality.trim().slice(2)) > 0);
+  });
+  if (body.length >= 1024 && acceptsGzip) {
+    // Only public monitoring payloads are compressed. Low-level asynchronous
+    // gzip saves bandwidth without blocking the reporting/event loop.
+    try {
+      const compressed = await promisify(gzip)(body, { level: 1 });
+      if (compressed.length < body.length) { body = compressed; headers['Content-Encoding'] = 'gzip'; }
+    } catch { /* Uncompressed JSON remains a valid fallback. */ }
+  }
+  if (res.destroyed) return;
+  headers['Content-Length'] = String(body.length);
+  res.writeHead(200, corsHeaders(headers));
+  res.end(body);
 }
 
 function corsHeaders(headers = {}) {
@@ -2096,7 +2073,7 @@ function corsHeaders(headers = {}) {
     ...headers,
     'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
     'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-CSRF-Token',
-    'Vary': 'Origin'
+    'Vary': headers.Vary ? `Origin, ${headers.Vary}` : 'Origin'
   });
   return next;
 }
@@ -2116,6 +2093,7 @@ function securityHeaders(headers = {}) {
       "form-action 'self'",
       "frame-ancestors 'none'"
     ].join('; '),
+    'X-Panel-Instance': String(panelStartedAt),
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'same-origin',
@@ -2319,9 +2297,9 @@ function normalizeBackgrounds(value = {}) {
   const admin = normalizeList(value.admin);
   return {
     frontendDesktop: normalizeList(value.frontendDesktop || value.frontendPc || value.frontendDesktopUrls || frontend),
-    frontendMobile: normalizeList(value.frontendMobile || value.mobileFrontend || value.frontendMobileUrls || frontend),
+    frontendMobile: normalizeList(value.frontendMobile ?? value.mobileFrontend ?? value.frontendMobileUrls ?? []),
     adminDesktop: normalizeList(value.adminDesktop || value.adminPc || value.adminDesktopUrls || admin),
-    adminMobile: normalizeList(value.adminMobile || value.mobileAdmin || value.adminMobileUrls || admin)
+    adminMobile: normalizeList(value.adminMobile ?? value.mobileAdmin ?? value.adminMobileUrls ?? [])
   };
 }
 
@@ -2670,11 +2648,11 @@ function inferHubUrl(req) {
 }
 
 function inferHubUrlFromConfig() {
-  return process.env.PUBLIC_HUB_URL || config.publicHubUrl || '';
+  return config.publicHubUrl || '';
 }
 
 async function syncPublicHubUrlFromRequest(req) {
-  if (process.env.PUBLIC_HUB_URL) return false;
+
   const inferred = inferHubUrlFromRequest(req);
   if (!shouldAutoSyncPublicHubUrl(config.publicHubUrl, inferred)) return false;
   return transactConfig((draft) => {
@@ -2976,7 +2954,9 @@ function normalizeViewerAccess(items) {
 }
 
 function normalizeHubUrl(value) {
-  const parsed = new URL(String(value || '').trim());
+  const text = String(value || '').trim();
+  const parsed = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : `http://${text}`);
+  if (parsed.username || parsed.password) throw new Error('hubUrl must not contain credentials');
   if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('hubUrl must be http or https');
   parsed.hash = '';
   parsed.search = '';

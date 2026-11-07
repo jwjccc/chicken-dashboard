@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, writeFile, cp, rm, chmod } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, cp, rm, chmod, access, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { once } from 'node:events';
 import { createRequire } from 'node:module';
 import vm from 'node:vm';
 import http from 'node:http';
+import { gunzipSync } from 'node:zlib';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
@@ -18,14 +19,16 @@ async function createHub(t, initial = {}) {
   await mkdir(path.join(directory, 'hub'));
   await mkdir(path.join(directory, 'data'));
   await cp(path.join(root, 'public'), path.join(directory, 'public'), { recursive: true });
+  await cp(path.join(root, 'agent'), path.join(directory, 'agent'), { recursive: true });
   await writeFile(path.join(directory, 'package.json'), '{"type":"module"}');
   if (initial.config) await writeFile(path.join(directory, 'data/config.json'), JSON.stringify(initial.config));
   if (initial.state) await writeFile(path.join(directory, 'data/state.json'), JSON.stringify(initial.state));
   let source = await readFile(path.join(root, 'hub/server.js'), 'utf8');
   // Export the actual deployed implementation from an isolated fixture. No
   // testing endpoints or test-only credentials are added to the live server.
-  source = 'const testIntervals = []; const trackedInterval = (...args) => { const timer = setInterval(...args); testIntervals.push(timer); return timer; };\n'
+  source = 'let testClosing = false; const testIntervals = []; const trackedInterval = (...args) => { const timer = setInterval(...args); testIntervals.push(timer); return timer; };\n'
     + source.replace(/\bsetInterval\(/g, 'trackedInterval(');
+  source = source.replace('function saveStateSoon() {', 'function saveStateSoon() { if (testClosing) return Promise.resolve();');
   source += `\nexport { server, state, config, connectivityDb, normalizeAgentReport, mergeAgentReport, isReportOnline, buildOverview, buildServerDetail, mergeServerConnectivity, calculateCycleTraffic, currentTrafficCycle, trafficCycleKey, updateTrafficCycleState, cachedServerIpQuality, refreshPanelServerIpApiQuality, runDueIpApiRefresh, reportIpSignature, clearIpApiCache, pruneAccessState, scheduleAccessLocationRefresh, publicFlagAssets, serverCountryCode, saveStateNow, saveStateSoon };
   export const testHooks = {
     getConfig() { return config; },
@@ -38,11 +41,14 @@ async function createHub(t, initial = {}) {
     setQualityLookup(fn) { lookupServerIpApiQualityDetailed = fn; },
     resetPrune() { connectivityPrunedAt = 0; },
     pruneConnectivityHistory,
-    async close() { for (const timer of testIntervals) clearInterval(timer); await saveStateNow(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); connectivityDb.close(); }
+    normalizeBackgrounds, normalizeHubUrl, isAgentEndpointRequest,
+    buildAgentInstaller, buildAgentUninstaller, buildInstallCommand, buildUninstallCommand, agentIdentityKey, transactConfig,
+    setRestart(fn) { performPanelRestart = fn; },
+    async close() { testClosing = true; for (const timer of testIntervals) clearInterval(timer); await saveStateNow(); server.closeAllConnections(); if(agentServer) {agentServer.closeAllConnections(); await new Promise(resolve=>agentServer.close(resolve));} await new Promise(resolve => server.close(resolve)); connectivityDb.close(); }
   };`;
   await writeFile(path.join(directory, 'hub/server.js'), source);
   const previousPort = process.env.PROBE_PORT;
-  process.env.PROBE_PORT = '0';
+  process.env.PROBE_PORT = initial.runtimePort == null ? '0' : String(initial.runtimePort);
   const signalListeners = new Map(['SIGTERM', 'SIGINT'].map((name) => [name, process.listeners(name)]));
   const hub = await import(pathToFileURL(path.join(directory, 'hub/server.js')));
   if (!hub.server.listening) await once(hub.server, 'listening');
@@ -635,4 +641,251 @@ test('Linux shell fallback sends valid metrics without waiting for metadata', { 
   assert.equal(typeof received.cpu.percent, 'number');
   assert.equal(typeof received.memory.total, 'number');
   assert.equal(typeof received.net.totalIn, 'number');
+});
+
+test('background scopes remain independent and compact polling keeps real preview points', async t => {
+  const hub=await createHub(t);
+  const backgrounds=hub.testHooks.normalizeBackgrounds({frontend:['legacy'],frontendDesktop:['desktop'],frontendMobile:[],adminDesktop:['admin'],adminMobile:[]});
+  assert.deepEqual(backgrounds.frontendMobile,[]);
+  assert.deepEqual(backgrounds.adminMobile,[]);
+  assert.deepEqual(backgrounds.frontendDesktop,['desktop']);
+  assert.deepEqual(backgrounds.adminDesktop,['admin']);
+  assert.equal(hub.testHooks.normalizeHubUrl('monitor.example.com:8080'),'http://monitor.example.com:8080');
+  const now=Date.now();
+  hub.config.servers.push({id:'compact',name:'Compact',secret:'fixture'});
+  hub.state.servers.compact={lastReportAt:now,cpu:{percent:31},memory:{percent:44}};
+  hub.state.history.compact=Array.from({length:60},(_,i)=>({t:now-(59-i)*2000,cpu:i,mem:40,swap:0,inBps:20,outBps:30,tcp:5,udp:2}));
+  const full=await realFetch(hub.base+'/api/overview').then(r=>r.json());
+  const response=await realFetch(hub.base+'/api/overview?compact=1');
+  assert.equal(response.headers.get('cache-control'),'no-store');
+  assert.ok(response.headers.get('x-panel-instance'));
+  const compact=await response.json();
+  assert.deepEqual(full.servers,compact.servers);
+  assert.equal(compact.detailSnapshots.compact.history,undefined);
+  assert.equal(compact.detailSnapshots.compact.point.t,now);
+  assert.ok(JSON.stringify(compact).length<JSON.stringify(full).length*0.7);
+});
+
+async function unusedPort() {
+  const listener=http.createServer();listener.listen(0,'0.0.0.0');await once(listener,'listening');
+  const port=listener.address().port;await new Promise(resolve=>listener.close(resolve));return port;
+}
+
+test('port saves revoke sessions, reject old agent ports, and persist over stale systemd environment', async t => {
+  const agentPort=await unusedPort(),newAgentPort=await unusedPort(),newPanelPort=await unusedPort();
+  const hub=await createHub(t,{config:{port:8080,publicHubUrl:`http://127.0.0.1:${agentPort}`,servers:[{id:'ports',name:'Ports',secret:'ports-fixture'}]}});
+  let restarts=0;hub.testHooks.setRestart(()=>{restarts++;});
+  const agentBase=`http://127.0.0.1:${agentPort}`;
+  const report=(base,token='ports-fixture')=>realFetch(base+'/api/agent/report',{method:'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:JSON.stringify({id:'ports',cpu:{percent:55}})});
+  assert.equal((await report(hub.base)).status,410);
+  assert.equal((await report(agentBase)).status,200);
+  assert.equal((await realFetch(agentBase+'/api/overview')).status,404);
+  // Whitelist protects viewers, while the active Agent port still requires its token.
+  hub.config.ipWhitelistEnabled=true;hub.config.ipWhitelist=['198.51.100.99'];
+  assert.equal((await realFetch(hub.base+'/api/overview')).status,404);
+  assert.equal((await report(agentBase,'wrong')).status,401);
+  hub.testHooks.resetReportRate('ports');assert.equal((await report(agentBase)).status,200);
+  hub.config.ipWhitelist=['127.0.0.1'];
+  const login=await realFetch(hub.base+'/api/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:'admin',password:'admin'})});
+  const cookie=login.headers.get('set-cookie').split(';')[0],{csrfToken}=await login.json();
+  const headers={'Content-Type':'application/json',Cookie:cookie,'X-CSRF-Token':csrfToken};
+  const save=basics=>realFetch(hub.base+'/api/admin/settings',{method:'POST',headers,body:JSON.stringify({basics})});
+  const invalid=await save({publicHubUrl:'https://monitor.example.com:8080'});
+  assert.equal(invalid.status,400);assert.equal((await invalid.json()).error,'https_proxy_required');
+  const occupied=http.createServer();occupied.listen(0,'0.0.0.0');await once(occupied,'listening');
+  try {assert.equal((await save({panelPort:occupied.address().port})).status,400);} finally {await new Promise(r=>occupied.close(r));}
+  const started=performance.now();
+  const result=await save({panelPort:newPanelPort,publicHubUrl:`127.0.0.1:${newAgentPort}`});
+  assert.equal(result.status,200);
+  const data=await result.json();
+  assert.ok(performance.now()-started<1500,'save acknowledges without waiting for overview/geolocation');
+  assert.equal(data.restartRequired,true);assert.equal(data.restart.newPanelPort,newPanelPort);
+  assert.equal((await realFetch(hub.base+'/api/admin/session',{headers:{Cookie:cookie}}).then(r=>r.json())).ok,false);
+  assert.equal((await report(agentBase)).status,410);
+  await new Promise(r=>setTimeout(r,220));assert.equal(restarts,1);
+  const persisted=JSON.parse(await readFile(path.join(hub.directory,'data/config.json'),'utf8'));
+  const restarted=await createHub(t,{config:persisted,runtimePort:new URL(hub.base).port});
+  assert.equal(Number(new URL(restarted.base).port),newPanelPort,'saved panel port wins over original PROBE_PORT');
+  const newBase=`http://127.0.0.1:${newAgentPort}`;
+  assert.equal((await report(newBase)).status,200);
+  assert.equal((await report(restarted.base)).status,410);
+  assert.equal((await realFetch(restarted.base+'/api/admin/servers',{headers})).status,401);
+  // Turning the whitelist on after changing ports cannot block authenticated Agents.
+  restarted.config.ipWhitelistEnabled=false;
+  restarted.testHooks.resetReportRate('ports');assert.equal((await report(newBase)).status,200);
+  restarted.config.ipWhitelistEnabled=true;restarted.config.ipWhitelist=['198.51.100.88'];
+  restarted.testHooks.resetReportRate('ports');assert.equal((await report(newBase)).status,200);
+  assert.equal((await realFetch(restarted.base+'/api/overview')).status,404);
+});
+
+test('manual restart uses the same session invalidation and announcement',async t=>{
+  const hub=await createHub(t);let restarts=0;hub.testHooks.setRestart(()=>{restarts++;});
+  const login=await realFetch(hub.base+'/api/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:'admin',password:'admin'})});
+  const cookie=login.headers.get('set-cookie').split(';')[0],{csrfToken}=await login.json();
+  const result=await realFetch(hub.base+'/api/admin/restart',{method:'POST',headers:{Cookie:cookie,'X-CSRF-Token':csrfToken},body:'{}'});
+  assert.equal(result.status,200);assert.ok((await result.json()).restart.panelStartedAt);
+  assert.equal((await realFetch(hub.base+'/api/admin/session',{headers:{Cookie:cookie}}).then(r=>r.json())).ok,false);
+  assert.ok((await realFetch(hub.base+'/healthz').then(r=>r.json())).restart);
+  await new Promise(r=>setTimeout(r,220));assert.equal(restarts,1);
+});
+
+test('detail history sends only new real samples and recovers lost cursors; public JSON supports gzip', async t => {
+  const hub = await createHub(t);
+  const now = Date.now();
+  hub.config.servers.push({id:'bandwidth', name:'Bandwidth', secret:'fixture'});
+  hub.state.servers.bandwidth = {lastReportAt:now, cpu:{percent:37}, net:{inBps:12345,outBps:54321}};
+  const history = Array.from({length:500},(_,i)=>({t:now-(499-i)*2000,cpu:i%100,mem:40,swap:0,inBps:12345+i,outBps:54321-i,tcp:5,udp:2}));
+  hub.state.history.bandwidth = history;
+  const endpoint = hub.base+'/api/servers/bandwidth?connectivityHistory=0';
+  const read = suffix => realFetch(endpoint+suffix).then(r=>r.json());
+  const full = await read('');
+  assert.equal(full.historyMode,'full');
+  assert.deepEqual(full.history,history);
+  assert.equal(full.historyCursor,now);
+  const newer = await read('&historySince='+history[497].t);
+  assert.equal(newer.historyMode,'incremental');
+  assert.deepEqual(newer.history,history.slice(-2));
+  assert.deepEqual(newer.server.net,full.server.net,'actual network measurements must not be subtracted or hidden');
+  assert.ok(JSON.stringify(newer).length < JSON.stringify(full).length*0.15);
+  const unchanged = await read('&historySince='+now);
+  assert.equal(unchanged.history.length,0);
+  assert.equal(unchanged.historyCursor,now);
+  for (const cursor of [now+1,history[0].t-2000,-1,'NaN']) {
+    const reset=await read('&historySince='+cursor);
+    assert.equal(reset.historyMode,'full');assert.equal(reset.history.length,500);
+  }
+  // Missed updates are delivered together, with no synthetic intermediate samples.
+  hub.state.history.bandwidth.push({...history.at(-1),t:now+60000,cpu:83});
+  hub.state.servers.bandwidth.lastReportAt=now+60000;
+  const resumed = await read('&historySince='+now);
+  assert.deepEqual(resumed.history.map(p=>p.t),[now+60000]);
+  assert.equal(resumed.historyStartAt,history[1].t);
+  const raw = encoding => new Promise((resolve,reject)=>{
+    http.get(endpoint,{headers:{'Accept-Encoding':encoding}},response=>{
+      const chunks=[];response.on('data',c=>chunks.push(c));response.on('end',()=>resolve({headers:response.headers,body:Buffer.concat(chunks)}));response.on('error',reject);
+    }).on('error',reject);
+  });
+  const compressed=await raw('br, gzip;q=0.8');
+  assert.equal(compressed.headers['content-encoding'],'gzip');
+  assert.match(compressed.headers.vary,/Origin/);assert.match(compressed.headers.vary,/Accept-Encoding/);
+  assert.equal(compressed.headers['cache-control'],'no-store');
+  const decoded=JSON.parse(gunzipSync(compressed.body));
+  assert.deepEqual(decoded.history,hub.state.history.bandwidth.slice(-500));
+  assert.ok(compressed.body.length<Buffer.byteLength(JSON.stringify(decoded))*0.3);
+  assert.equal(Number(compressed.headers['content-length']),compressed.body.length);
+  for(const encoding of ['gzip;q=0','identity','deflate']) {
+    const plain=await raw(encoding);
+    assert.equal(plain.headers['content-encoding'],undefined);assert.equal(JSON.parse(plain.body).history.length,500);
+  }
+  const overview=await realFetch(hub.base+'/api/overview?compact=1',{headers:{'Accept-Encoding':'gzip'}});
+  assert.equal(overview.headers.get('content-encoding'),'gzip');
+  assert.equal((await overview.json()).servers[0].net.outBps,54321);
+});
+
+test('panel identity survives address changes and restarts; legacy fingerprints survive server deletion', async t => {
+  const hub=await createHub(t,{config:{servers:[{id:'identity-node',secret:'identity-token'}]}});
+  const id=hub.config.panelId;
+  assert.match(id,/^pnl-[a-f0-9]{32}$/);
+  const key=hub.testHooks.agentIdentityKey('identity-node','identity-token');
+  assert.ok(hub.config.agentIdentityKeys.includes(key));
+  await hub.testHooks.transactConfig(draft=>{draft.publicHubUrl='http://new-host.example:9080';draft.servers=[];});
+  const persisted=JSON.parse(await readFile(path.join(hub.directory,'data/config.json'),'utf8'));
+  assert.equal(persisted.panelId,id);assert.ok(persisted.agentIdentityKeys.includes(key));
+  const restored=await createHub(t,{config:persisted});
+  assert.equal(restored.config.panelId,id);
+  const another=await createHub(t);assert.notEqual(another.config.panelId,id);
+  const command=hub.testHooks.buildUninstallCommand({hubUrl:'http://new-host.example:9080'});
+  assert.ok(command.includes(`PROBE_PANEL_ID='${id}'`));
+  assert.ok(!command.includes('PROBE_HUB_URL='),'uninstall identity is independent of the endpoint used to download it');
+  const script=hub.testHooks.buildAgentUninstaller();
+  assert.ok(script.includes(key));assert.ok(!script.includes('identity-token'));
+  const install=hub.testHooks.buildInstallCommand({hubUrl:'http://new-host.example:9080',token:'fixture',serverId:'fixture',serverName:'fixture',serverLocation:'',interval:2,reuseExisting:true});
+  assert.ok(install.includes('PROBE_REUSE_EXISTING=1'));assert.ok(install.includes(id));
+});
+
+test('Linux Agent lifecycle migrates URL instances, updates one panel, rolls back failures and never removes other panels', {skip:process.platform!=='linux'}, async t => {
+  const hub=await createHub(t,{config:{servers:[{id:'owned',secret:'owned-token'}],pendingInstalls:[{id:'pending-new',secret:'pending-token',expiresAt:Date.now()+600000}]}});
+  const fixture=await mkdtemp(path.join(root,'.test-runtime-agent-'));
+  t.after(()=>rm(fixture,{recursive:true,force:true}));
+  const opt=path.join(fixture,'opt'),etc=path.join(fixture,'etc'),run=path.join(fixture,'run'),bin=path.join(fixture,'bin'),mock=path.join(fixture,'mock');
+  for(const directory of [opt,etc,run,bin,mock,path.join(etc,'systemd/system')])await mkdir(directory,{recursive:true});
+  const quoted=value=>`'${value.replace(/'/g,"'\\''")}'`;
+  const stageScript=async(action)=>{
+    const source=action==='install'?hub.testHooks.buildAgentInstaller():hub.testHooks.buildAgentUninstaller();
+    const file=path.join(fixture,action+'.sh');
+    await writeFile(file,source.replace('OPT_ROOT=/opt','OPT_ROOT='+quoted(opt)).replace('ETC_ROOT=/etc','ETC_ROOT='+quoted(etc)).replace('RUN_ROOT=/run','RUN_ROOT='+quoted(run)));
+    await promisify(execFile)('bash',['-n',file]);return file;
+  };
+  const install=await stageScript('install'),uninstall=await stageScript('uninstall');
+  const scripts={
+    systemctl:`printf '%s\\n' "$*" >> "$MOCK_STATE/commands"
+unit="\${@: -1}"
+case "$1" in
+ is-active) test -f "$MOCK_STATE/$unit.active" ;;
+ is-enabled) test -f "$MOCK_STATE/$unit.enabled" ;;
+ stop) rm -f "$MOCK_STATE/$unit.active" ;;
+ disable) rm -f "$MOCK_STATE/$unit.enabled" ;;
+ enable) touch "$MOCK_STATE/$unit.enabled" ;;
+ restart) if [ "\${MOCK_FAIL_RESTART:-}" = "$unit" ]; then exit 1; fi; touch "$MOCK_STATE/$unit.active" ;;
+esac`,
+    pkill:'exit 1',
+    curl:`[ "\${MOCK_FAIL_DOWNLOAD:-0}" != 1 ] || exit 22
+target=''; url=''
+while [ "$#" -gt 0 ]; do if [ "$1" = -o ]; then shift; target=$1; elif [[ "$1" == http* ]]; then url=$1; fi; shift; done
+if [[ "$url" == */probe-node.cjs ]]; then printf 'setInterval(()=>{},1000);\\n' > "$target"; else printf '#!/usr/bin/env bash\\nexit 0\\n' > "$target"; fi`
+  };
+  for(const [name,body]of Object.entries(scripts)){const file=path.join(bin,name);await writeFile(file,'#!/usr/bin/env bash\nset -eu\n'+body+'\n');await chmod(file,0o755);}
+  const canonical='server-probe-agent-'+hub.config.panelId+'.service';
+  const foreignId='pnl-'+'f'.repeat(32),foreign='server-probe-agent-'+foreignId+'.service';
+  const ipUnit='server-probe-agent-111111111111.service',domainUnit='server-probe-agent-222222222222.service',unrelated='server-probe-agent-333333333333.service';
+  const envPath=unit=>path.join(etc,unit==='server-probe-agent.service'?'server-probe-agent.env':unit+'.env');
+  const seed=async(unit,{token='owned-token',id='owned',panel='',url='http://198.51.100.1:8080'}={})=>{
+    const directory=path.join(opt,unit.replace(/\.service$/,''));await mkdir(directory,{recursive:true});
+    await writeFile(path.join(directory,'probe.sh'),'old-code');
+    await writeFile(envPath(unit),`HUB_URL="${url}"\nAGENT_TOKEN="${token}"\nSERVER_ID="${id}"\nSERVER_NAME="$(touch ${fixture}/must-not-execute)"\nPANEL_ID="${panel}"\n`);
+    await writeFile(path.join(etc,'systemd/system',unit),'old-unit');
+    await writeFile(path.join(mock,unit+'.active'),'');await writeFile(path.join(mock,unit+'.enabled'),'');
+  };
+  await seed(ipUnit);await seed(domainUnit,{url:'http://panel.example:8080'});
+  await seed('server-probe-agent.service');
+  await seed(unrelated,{token:'another-token'});
+  // Even an identical legacy credential fingerprint cannot override another explicit panel ID.
+  await seed(foreign,{panel:foreignId});
+  const foreignEnv=await readFile(envPath(foreign),'utf8');
+  const env={...process.env,PATH:bin+':'+process.env.PATH,MOCK_STATE:mock,PROBE_HUB_URL:'http://panel.example:9080',PROBE_PANEL_ID:hub.config.panelId,PROBE_SERVER_ID:'pending-new',PROBE_AGENT_TOKEN:'pending-token',PROBE_REUSE_EXISTING:'1'};
+  const execute=(script,extra={})=>promisify(execFile)('bash',[script],{env:{...env,...extra},timeout:15000});
+  const exists=file=>access(file).then(()=>true,()=>false);
+  await assert.rejects(execute(install,{MOCK_FAIL_DOWNLOAD:'1'}));
+  assert.ok(await exists(envPath(ipUnit)));assert.ok(await exists(path.join(mock,ipUnit+'.active')));
+  await assert.rejects(execute(install,{MOCK_FAIL_RESTART:canonical}));
+  assert.ok(await exists(envPath(ipUnit)));assert.ok(await exists(path.join(mock,ipUnit+'.active')));
+  assert.equal(await exists(envPath(canonical)),false);
+  await execute(install);
+  let content=await readFile(envPath(canonical),'utf8');
+  assert.ok(content.includes(`PANEL_ID="${hub.config.panelId}"`));
+  assert.ok(content.includes('SERVER_ID="owned"'));assert.ok(content.includes('AGENT_TOKEN="owned-token"'));
+  assert.ok(content.includes('HUB_URL="http://panel.example:9080"'));
+  for(const old of [ipUnit,domainUnit,'server-probe-agent.service'])assert.equal(await exists(envPath(old)),false);
+  assert.equal(await exists(path.join(fixture,'must-not-execute')),false,'existing files must not be sourced or evaluated');
+  assert.equal(await readFile(envPath(foreign),'utf8'),foreignEnv);
+  assert.ok(await exists(envPath(unrelated)));
+  await mkdir(path.join(run,canonical.replace(/\.service$/,'')),{recursive:true});
+  await writeFile(path.join(run,canonical.replace(/\.service$/,''),'stale-rules'),'old');
+  await execute(install,{PROBE_HUB_URL:'http://198.51.100.99:10080'});
+  content=await readFile(envPath(canonical),'utf8');
+  assert.ok(content.includes('HUB_URL="http://198.51.100.99:10080"'));
+  assert.equal(await exists(path.join(run,canonical.replace(/\.service$/,''),'stale-rules')),false);
+  assert.equal((await readdir(opt)).filter(name=>name==='server-probe-agent-'+hub.config.panelId).length,1);
+  await assert.rejects(execute(uninstall,{PROBE_PANEL_ID:foreignId}));
+  assert.ok(await exists(envPath(canonical)));
+  // A saved uninstall script remains usable after an address change and without a hub URL.
+  await execute(uninstall,{PROBE_HUB_URL:'',HUB_URL:''});
+  assert.equal(await exists(envPath(canonical)),false);
+  assert.ok(await exists(path.join(mock,foreign+'.active')));assert.ok(await exists(path.join(mock,unrelated+'.active')));
+  assert.match((await execute(uninstall)).stdout,/No agent belonging/);
+  // Directly uninstall legacy instances too; migration is not a prerequisite.
+  await seed(ipUnit);await seed(domainUnit);
+  await execute(uninstall);
+  assert.equal(await exists(envPath(ipUnit)),false);assert.equal(await exists(envPath(domainUnit)),false);
+  assert.equal(await readFile(envPath(foreign),'utf8'),foreignEnv);
 });
