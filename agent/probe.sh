@@ -140,7 +140,7 @@ probe_connectivity_target() {
   [[ "$attempts" =~ ^[1-4]$ ]] || attempts=4
   [[ "$task_at" =~ ^[0-9]+$ ]] || task_at=0
   for ((attempt=1;attempt<=attempts;attempt++)); do
-    if latency=$(tcp_latency_ms "$host" "$port") && [[ "$latency" =~ ^[0-9]+$ ]] && ((latency>0)); then
+    if latency=$(tcp_latency_ms "$host" "$port") && [[ "$latency" =~ ^[0-9]+$ ]]; then
       ok=true; error=""; packet_loss=0; break
     fi
     latency=0

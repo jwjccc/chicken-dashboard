@@ -323,7 +323,7 @@ function tcpLatency(check) {
     const started=performance.now();let settled=false, socket;
     const done=(ok,error='')=>{
       if(settled)return;settled=true;clearTimeout(deadline);socket?.destroy();
-      resolve({id:check.id,name:check.name,ok,error,latencyMs:ok?Math.max(0.01,Number((performance.now()-started).toFixed(2))):0,
+      resolve({id:check.id,name:check.name,ok,error,latencyMs:ok?Math.max(0,performance.now()-started):0,
         packetLossPercent:ok?0:100,checkedAt:Date.now()});
     };
     const deadline=setTimeout(()=>done(false,'timeout'),2000);
@@ -339,9 +339,9 @@ async function probeWithRetries(check) {
   const limit=check.maxAttempts || 4;
   for(let attempt=1;attempt<=limit;attempt++) {
     try { result=await tcpLatency(check); } catch(err) {result={ok:false,error:err.message};}
-    const valid=result?.ok && Number.isFinite(result.latencyMs) && result.latencyMs>0;
+    const valid=result?.ok && Number.isFinite(result.latencyMs) && result.latencyMs>=0;
     if(valid || attempt===limit) return {...result,id:check.id,name:check.name,ok:Boolean(valid),
-      latencyMs:valid?result.latencyMs:0,packetLossPercent:valid?0:100,checkedAt:Date.now(),
+      latencyMs:valid?Math.trunc(result.latencyMs):0,packetLossPercent:valid?0:100,checkedAt:Date.now(),
       final:true,attempts:attempt,taskAt:check.taskAt || 0};
   }
 }

@@ -454,6 +454,9 @@ async function showDetail(id) {
   if (routeToken && location.hash !== `#server/${encodeURIComponent(routeToken)}`) {
     history.replaceState(null, '', `#server/${encodeURIComponent(routeToken)}`);
   }
+  // Reset only on entry, after the cached detail has replaced the homepage.
+  // Live updates and tab changes must retain the reader's scroll position.
+  window.scrollTo({ top: 0, left: 0, behavior: 'instant' });
   await loadActiveDetail();
 }
 
@@ -1408,7 +1411,7 @@ function renderConnectivityChecks(checks) {
       <td>${escapeHtml(check.target)}</td>
       <td>${escapeHtml(check.type || 'tcping')}</td>
       <td>${Number(check.intervalSeconds || 300) / 60} 分钟</td>
-      <td>${check.result?.latencyMs != null ? `${check.result.latencyMs} ms` : '--'}</td>
+      <td>${check.result?.latencyMs != null ? `${Math.trunc(check.result.latencyMs)} ms` : '--'}</td>
       <td class="admin-table-actions">
         <button type="button" class="admin-action-edit" data-edit-connectivity="${escapeHtml(check.id)}" data-name="${escapeHtml(check.name)}" data-target="${escapeHtml(check.target)}" data-interval="${Number(check.intervalSeconds || 300) / 60}">修改</button>
         <button type="button" class="danger" data-delete-connectivity="${escapeHtml(check.id)}" data-name="${escapeHtml(check.name)}">删除</button>
@@ -2255,10 +2258,10 @@ function regionLatencySummaryHtml(checks) {
       <div class="network-quality-summary-item">
         <button class="network-quality-filter" type="button" data-network-filter="${escapeHtml(check.id)}">
           <span class="network-quality-node-name">${escapeHtml(check.name)}</span>
-          <strong>${stats.latest == null ? '--' : `${stats.latest.toFixed(2)}ms`}</strong>
+          <strong>${stats.latest == null ? '--' : `${Math.trunc(stats.latest)}ms`}</strong>
           <span class="network-quality-extremes">
-            <small class="network-quality-min" title="区间最低延迟">↓ ${stats.min == null ? '--' : `${stats.min.toFixed(2)}ms`}</small>
-            <small class="network-quality-max" title="区间最高延迟">↑ ${stats.max == null ? '--' : `${stats.max.toFixed(2)}ms`}</small>
+            <small class="network-quality-min" title="区间最低延迟">↓ ${stats.min == null ? '--' : `${Math.trunc(stats.min)}ms`}</small>
+            <small class="network-quality-max" title="区间最高延迟">↑ ${stats.max == null ? '--' : `${Math.trunc(stats.max)}ms`}</small>
           </span>
           <small class="network-quality-loss">丢包 ${stats.loss == null ? '--' : `${stats.loss.toFixed(2)}%`}</small>
         </button>
@@ -2284,7 +2287,7 @@ function connectivitySummaryStats(check) {
   let lossCount = 0;
   for (const point of history) {
     const latency = Number(point?.latencyMs);
-    if (Number.isFinite(latency) && latency > 0) {
+    if (Number.isFinite(latency) && (latency > 0 || (latency === 0 && point.ok))) {
       min = min == null ? latency : Math.min(min, latency);
       max = max == null ? latency : Math.max(max, latency);
     }
@@ -2462,8 +2465,8 @@ function renderNetworkQualityChart(checks) {
         if (!Number.isFinite(time)) return '';
         const rows = visibleChecks.map(check => {
           const point = nearestNetworkQualityObservation(models.get(check.id), time);
-          const text = point?.value != null ? `${point.value.toFixed(2)}ms` : '--';
-          const title = point ? `采样时间：${formatFullDateTime(point.t)}${point.failed ? '；探测失败，按0.00ms显示' : point.outlier ? '；异常样本已剔除绘图' : ''}` : '此时段尚无样本';
+          const text = point?.value != null ? `${Math.trunc(point.value)}ms` : '--';
+          const title = point ? `采样时间：${formatFullDateTime(point.t)}${point.failed ? '；探测失败，按0ms显示' : point.outlier ? '；异常样本已剔除绘图' : ''}` : '此时段尚无样本';
           return `<div class="echart-tooltip-row" title="${escapeHtml(title)}"><span><i style="background:${colorFor(check)}"></i>${escapeHtml(check.name)}</span><strong>${text}</strong></div>`;
         }).join('');
         return `<div class="echart-tooltip-time">${formatFullDateTime(timeline.fromX(time))}</div>${rows}`;
@@ -2483,8 +2486,9 @@ function renderNetworkQualityChart(checks) {
         return Math.max(10, Math.ceil(max * 1.15));
       },
       splitNumber: 4,
+      minInterval: 1,
       axisLine: { show: false }, axisTick: { show: false }, splitLine: { lineStyle: { color: gridColor } },
-      axisLabel: { color: axisColor, fontSize: 11, formatter: (value) => `${Math.round(value)}ms` }
+      axisLabel: { color: axisColor, fontSize: 11, formatter: (value) => `${Math.trunc(value)}ms` }
     },
     series: [
       ...visibleChecks.map((check) => {
@@ -2550,7 +2554,7 @@ function networkQualityTimeline(checks) {
 
 function networkQualitySeriesModel(check, timeline = networkQualityTimeline([check])) {
   const observations = (check.history || []).map(point => ({ t:Number(point.t), x:timeline.toX(Number(point.t)),
-    value:point.ok && Number(point.latencyMs)>0 ? Number(point.latencyMs) : 0, failed:!point.ok }));
+    value:point.ok && Number(point.latencyMs)>0 ? Math.trunc(Number(point.latencyMs)) : 0, failed:!point.ok }));
   const values = observations.map(point=>point.value);
   const display = values.slice();
   if (networkQualityPeakCut) {
@@ -2644,8 +2648,8 @@ function aggregateConnectivityHistory(history, cutoff) {
     const t = Number(point.lastAt || point.t || 0);
     if (!Number.isFinite(t) || t <= 0 || t < cutoff) continue;
     const latency = Number(point.count ? point.lastLatency : point.latencyMs);
-    const ok = Boolean((point.count ? point.lastOk : point.ok) && Number.isFinite(latency) && latency > 0);
-    samples.set(t, { t, latencyMs: ok ? latency : 0, ok,
+    const ok = Boolean((point.count ? point.lastOk : point.ok) && Number.isFinite(latency) && latency >= 0);
+    samples.set(t, { t, latencyMs: ok ? Math.trunc(latency) : 0, ok,
       packetLossPercent: point.packetLossPercent ?? (ok ? 0 : 100) });
   }
   return [...samples.values()].sort((a, b) => a.t - b.t);
@@ -3487,7 +3491,8 @@ function formatBytes(bytes) {
   const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
   let value = n, idx = 0;
   while (Math.abs(value) >= 1024 && idx < units.length - 1) { value /= 1024; idx += 1; }
-  return `${fmt.format(value)} ${units[idx]}`;
+  // Truncate the displayed unit; leave the original byte counters intact.
+  return `${(Math.trunc(value * 100) / 100).toFixed(2)} ${units[idx]}`;
 }
 function formatBps(bytes) { return `${formatBytes(bytes)}/s`; }
 function pct(value) { return fmt.format(Number(value || 0)); }

@@ -307,9 +307,9 @@ async function loadState() {
 }
 
 function hydrateConnectivityState() {
-  for (const [id, result] of Object.entries(state.connectivityResults || {})) connectivityResults.set(id, result);
+  for (const [id, result] of Object.entries(state.connectivityResults || {})) connectivityResults.set(id, { ...result, latencyMs: Math.trunc(Number(result.latencyMs) || 0) });
   for (const [id, history] of Object.entries(state.connectivityHistory || {})) {
-    if (Array.isArray(history)) connectivityHistory.set(id, history);
+    if (Array.isArray(history)) connectivityHistory.set(id, aggregateConnectivityHistory(history, 0));
   }
 }
 
@@ -2441,8 +2441,8 @@ function aggregateConnectivityHistory(history, cutoff) {
     const t = Number(point.lastAt || point.t || 0);
     if (!Number.isFinite(t) || t <= 0 || t < cutoff) continue;
     const latency = Number(point.count ? point.lastLatency : point.latencyMs);
-    const ok = Boolean((point.count ? point.lastOk : point.ok) && Number.isFinite(latency) && latency > 0);
-    samples.set(t, { t, latencyMs: ok ? latency : 0, ok,
+    const ok = Boolean((point.count ? point.lastOk : point.ok) && Number.isFinite(latency) && latency >= 0);
+    samples.set(t, { t, latencyMs: ok ? Math.trunc(latency) : 0, ok,
       packetLossPercent: point.packetLossPercent ?? (ok ? 0 : 100) });
   }
   return [...samples.values()].sort((a, b) => a.t - b.t);
@@ -2489,7 +2489,7 @@ function publicServerConnectivityChecks(serverId, results, serverLastReportAt = 
       result: hasServerResult ? {
         ok: Boolean(item.ok),
         error: item.error || '',
-        latencyMs: Number.isFinite(latency) ? latency : 0,
+        latencyMs: Number.isFinite(latency) ? Math.trunc(latency) : 0,
         packetLossPercent,
         checkedAt
       } : null,
@@ -2512,8 +2512,9 @@ function mergeServerConnectivity(serverId, results) {
     // Missing targets and repeated/stale reports must never create synthetic
     // timeouts or duplicate historical samples.
     if (!item || !checkedAt || checkedAt <= Number(prior?.checkedAt || 0)) return prior ? [prior] : [];
-    const latencyMs = Number.isFinite(Number(item.latencyMs)) ? Math.max(0, Number(item.latencyMs)) : 0;
-    const ok = Boolean(item.ok && latencyMs > 0);
+    const rawLatency = Number(item.latencyMs);
+    const ok = Boolean(item.ok && item.latencyMs != null && Number.isFinite(rawLatency) && rawLatency >= 0);
+    const latencyMs = ok ? Math.trunc(rawLatency) : 0;
     const job=state.agentConnectivityServed[serverId]?.[check.id];
     if (job && item.taskAt && Number(item.taskAt)!==job.slotAt) return prior ? [prior] : [];
     if (job?.awaiting && !item.taskAt && checkedAt < job.dispatchedAt-5000) return prior ? [prior] : [];
@@ -2561,10 +2562,10 @@ async function runConnectivityCheck(check) {
   let result;
   for(let attempt=0;attempt<4;attempt++) {
     result=await runConnectivityCheckAttempt(check);
-    if(result.ok && result.latencyMs>0) break;
+    if(result.ok && Number.isFinite(result.latencyMs) && result.latencyMs>=0) break;
   }
   setConnectivityResult(check.id,result);
-  return result;
+  return connectivityResults.get(check.id);
 }
 
 function runConnectivityCheckAttempt(check) {
@@ -2579,7 +2580,7 @@ function runConnectivityCheckAttempt(check) {
       finished = true;
       clearTimeout(deadline);
       socket.destroy();
-      const result = { ok, error, latencyMs: ok ? Math.max(0.01,Number((performance.now()-started).toFixed(2))) : 0, checkedAt: Date.now() };
+      const result = { ok, error, latencyMs: ok ? Math.max(0, performance.now()-started) : 0, checkedAt: Date.now() };
       resolve(result);
     };
     const deadline=setTimeout(()=>done(false,'timeout'),5000);
@@ -2590,6 +2591,7 @@ function runConnectivityCheckAttempt(check) {
 }
 
 function setConnectivityResult(id, result) {
+  result = { ...result, latencyMs: result.ok ? Math.trunc(Number(result.latencyMs) || 0) : 0 };
   connectivityResults.set(id, result);
   const history = connectivityHistory.get(id) || [];
   history.push({ t: result.checkedAt || Date.now(), latencyMs: result.latencyMs, ok: Boolean(result.ok), packetLossPercent: normalizePacketLossPercent(result.packetLossPercent ?? result.packetLoss, result.ok ? 0 : 100) });

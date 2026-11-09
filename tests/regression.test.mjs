@@ -427,13 +427,42 @@ test('agent retries only the failed target and preserves real successful measure
   try{
     vm.runInContext(`const attemptsById={}; tcpLatency=async check=>{const n=attemptsById[check.id]=(attemptsById[check.id] || 0)+1;return {ok:check.id==='good'||check.id==='recover'&&n===3,latencyMs:check.id==='good'?12.34:check.id==='recover'&&n===3?45.67:0};};`,context);
     const [good,recover,failed]=await Promise.all(['good','recover','failed'].map(id=>context.probeWithRetries({id,maxAttempts:4,taskAt:123})));
-    assert.equal(good.attempts,1);assert.equal(good.latencyMs,12.34);
-    assert.equal(recover.attempts,3);assert.equal(recover.latencyMs,45.67);
+    assert.equal(good.attempts,1);assert.equal(good.latencyMs,12);
+    assert.equal(recover.attempts,3);assert.equal(recover.latencyMs,45);
     assert.equal(failed.attempts,4);assert.equal(failed.ok,false);assert.equal(failed.latencyMs,0);assert.equal(failed.final,true);
     assert.equal(failed.taskAt,123);
+    vm.runInContext('tcpLatency=async()=>({ok:true,latencyMs:0.99})',context);
+    const subMs=await context.probeWithRetries({id:'local',maxAttempts:4});
+    assert.equal(subMs.latencyMs,0);assert.equal(subMs.ok,true);assert.equal(subMs.attempts,1);
     vm.runInContext('tcpLatency=async()=>{throw new Error("missing result")}',context);
     assert.equal((await context.probeWithRetries({id:'throws',maxAttempts:4})).attempts,4);
   }finally{vm.runInContext('httpAgent.destroy();httpsAgent.destroy();metadataHttpsAgent.destroy()',context);}
+});
+
+test('traffic precision truncates and latency persistence keeps successful sub-ms probes distinct from failures', async t => {
+  const source=await readFile(path.join(root,'public/app.js'),'utf8');
+  const context=vm.createContext({Intl,Math,Number});
+  vm.runInContext(source.slice(source.indexOf('function formatBytes('),source.indexOf('function pct(')),context);
+  for (const [bytes,expected] of [[3.859*1024**3,'3.85 GB'],[3.999*1024**3,'3.99 GB'],[1023.999*1024,'1023.99 KB'],[0,'0.00 B'],[1024,'1.00 KB']]) {
+    assert.equal(context.formatBytes(bytes),expected);
+    assert.equal(context.formatBps(bytes),expected+'/s');
+  }
+  const hub=await createHub(t);
+  const now=Date.now();
+  hub.config.servers=[{id:'precision',name:'Precision',secret:'fixture'}];
+  hub.config.connectivityChecks=[{id:'target',name:'Target',enabled:true,intervalSeconds:300}];
+  hub.state.servers.precision={lastReportAt:now,connectivity:[]};
+  for (const [i,latencyMs,ok,expected] of [[0,12.99,true,12],[1,0.99,true,0],[2,0,true,0],[3,99.99,false,0]]) {
+    const merged=hub.mergeServerConnectivity('precision',[{id:'target',checkedAt:now+i,latencyMs,ok,final:true}]);
+    hub.state.servers.precision.connectivity=merged;
+    assert.equal(merged[0].latencyMs,expected);assert.equal(merged[0].ok,ok);
+  }
+  const rows=hub.connectivityDb.prepare('SELECT latency_ms AS latency,ok FROM connectivity_history ORDER BY checked_at').all();
+  assert.deepEqual(rows.map(r=>[r.latency,r.ok]),[[12,1],[0,1],[0,1],[0,0]]);
+  const old=hub.testHooks.aggregateConnectivityHistory([{t:now,ok:true,latencyMs:45.99},{t:now+1,ok:true,latencyMs:0.99}],0);
+  assert.deepEqual(old.map(p=>[p.latencyMs,p.ok]),[[45,true],[0,true]]);
+  hub.state.servers.precision.connectivity=[{id:'target',checkedAt:now,latencyMs:45.99,ok:true}];
+  assert.equal((await hub.buildServerDetail('precision')).connectivity[0].result.latencyMs,45);
 });
 
 test('reconnect records an offline interval without generating intermediate probe rows', async (t) => {
