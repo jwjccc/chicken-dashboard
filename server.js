@@ -554,6 +554,9 @@ async function handleAgentReport(req, res) {
   }
 
   const meta = config.servers.find((server) => server.id === report.id);
+  if (isStaleTrafficReport(state.trafficCycles?.[report.id], report)) {
+    return sendJson(res, { ok: true, ignored: 'stale_report' });
+  }
   // Authentication is tied to the stable ID/secret, never the agent's address.
   // The authenticated connection also supplies a fresh address if discovery
   // services are unavailable or the agent still has a pre-reboot cached IP.
@@ -595,7 +598,7 @@ async function handleAgentReport(req, res) {
   // Notify the UI immediately after the in-memory report is committed. Do not
   // wait for history cleanup or state persistence before sending SSE.
   broadcast({ type: 'refresh', id: report.id, at: now });
-  maybeAppendHistoryPoint(report.id, compactHistoryPoint(report, now), now);
+  maybeAppendHistoryPoint(report.id, compactHistoryPoint(mergedReport, now), now);
   saveStateSoon().catch((err) => console.error(err));
   return sendJson(res, { ok: true, server: report.id });
 }
@@ -659,6 +662,8 @@ async function handleServerUpsert(req, res) {
       if (!draft.servers.some((server) => server.id === input.id) && draft.servers.length >= MAX_SERVERS) throw businessError('server_limit_reached', 'server limit reached');
       return upsertServerMeta(draft, input);
     });
+    reconcileTrafficCycle(next, state.servers[next.id] || {}, Date.now());
+    await saveStateNow();
     broadcast({ type: 'refresh', id: next.id, at: Date.now() });
     return sendJson(res, { ok: true, server: publicServerMeta(next) });
   } catch (err) {
@@ -673,7 +678,7 @@ function upsertServerMeta(draft, input) {
   const startedAt = has('startedAt') ? input.startedAt || null : current?.startedAt ?? null;
   const expiresAt = has('expiresAt') ? input.expiresAt || null : current?.expiresAt ?? null;
   const remainingInput = has('remainingTrafficBytes') || has('remainingTraffic')
-    ? input.remainingTrafficBytes ?? input.remainingTraffic
+    ? (has('remainingTrafficBytes') ? input.remainingTrafficBytes : input.remainingTraffic)
     : current?.remainingTrafficBytes;
   const priceInput = has('priceAmount') ? input.priceAmount : current?.priceAmount;
   const currencyInput = has('priceCurrency') ? input.priceCurrency : current?.priceCurrency;
@@ -1537,6 +1542,7 @@ function normalizeAgentReport(input) {
   const report = { id };
   for (const key of ['name','location','hostname','probeVersion','publicIp','ip','publicIpv4','ipv4','publicIpv6','ipv6','ipHostname','city','region','country','continent','latitude','longitude','postal','timezone','callingCode','currency','org','isp','asn','company','route','networkType']) report[key] = text(input[key], key === 'name' ? 128 : 256);
   report.uptimeSeconds = number(input.uptimeSeconds, 0, 3155760000);
+  report.bootId = text(input.bootId, 64);
   report.tags = Array.isArray(input.tags) ? input.tags.slice(0, 32).map((v) => text(v, 64)).filter(Boolean) : [];
   report.os = Object.fromEntries(['platform','version','arch','kernel'].map((k) => [k, text(object(input.os)[k], 128)]));
   report.cpu = { ...metric(input.cpu, [['percent',0,100],['cores',0,4096]]), model: text(object(input.cpu).model, 256), load: (Array.isArray(object(input.cpu).load) ? object(input.cpu).load : []).slice(0,3).map((v) => number(v,0,1e6)) };
@@ -1545,6 +1551,12 @@ function normalizeAgentReport(input) {
   if (!Object.hasOwn(object(input.swap), 'percent')) report.swap.percent = report.swap.total ? Math.min(100, report.swap.used * 100 / report.swap.total) : 0;
   report.disk = metric(input.disk, [['total',0,Number.MAX_SAFE_INTEGER],['used',0,Number.MAX_SAFE_INTEGER],['available',0,Number.MAX_SAFE_INTEGER],['percent',0,100]]);
   report.net = metric(input.net, [['inBps',0,Number.MAX_SAFE_INTEGER],['outBps',0,Number.MAX_SAFE_INTEGER],['totalIn',0,Number.MAX_SAFE_INTEGER],['totalOut',0,Number.MAX_SAFE_INTEGER]]);
+  // Missing/invalid counters are not a real reset to zero. Keep them absent
+  // so accounting and report merging can preserve the last valid baseline.
+  for (const key of ['totalIn', 'totalOut']) {
+    const raw = input.net?.[key];
+    if (raw == null || raw === '' || typeof raw === 'boolean' || !Number.isFinite(Number(raw)) || Number(raw) < 0) delete report.net[key];
+  }
   report.connections = metric(input.connections, [['tcp',0,1e7],['udp',0,1e7]]);
   report.connectivity = Array.isArray(input.connectivity) ? input.connectivity.slice(0, MAX_CONNECTIVITY_CHECKS).map((item) => ({ id: text(item?.id,96), name: text(item?.name,128), taskAt:number(item?.taskAt,0,Date.now()+300000), attempts:number(item?.attempts,1,4), final:item?.final===true, ok: item.ok, error: text(item?.error,256), latencyMs: number(item?.latencyMs,0,3600000), packetLossPercent: number(item?.packetLossPercent,0,100), checkedAt: number(item?.checkedAt,0,Date.now()+300000) })).filter((v) => v.id) : [];
   report.connectivityMeta = { count: number(input.connectivityMeta?.count,0,MAX_CONNECTIVITY_CHECKS), error: text(input.connectivityMeta?.error,256) };
@@ -1553,6 +1565,8 @@ function normalizeAgentReport(input) {
 
 function mergeAgentReport(previous = {}, incoming = {}) {
   const merged = { ...previous, ...incoming };
+  merged.net = { ...previous.net, ...incoming.net };
+  if (!incoming.bootId) merged.bootId = previous.bootId || '';
   // Startup/DNS failures yield empty metadata, not evidence that a known
   // country or location has disappeared. Preserve successful metadata.
   for (const field of ['location', 'ipHostname', 'city', 'region', 'country', 'continent', 'latitude', 'longitude', 'postal', 'timezone', 'callingCode', 'currency', 'org', 'isp', 'asn', 'company', 'route', 'networkType']) {
@@ -1851,6 +1865,8 @@ function compactHistoryPoint(report, now) {
     outBps: Number(report.net?.outBps || 0),
     totalIn: Number(report.net?.totalIn || 0),
     totalOut: Number(report.net?.totalOut || 0),
+    uptimeSeconds: Number(report.uptimeSeconds || 0),
+    bootId: report.bootId || '',
     tcp: Number(report.connections?.tcp || 0),
     udp: Number(report.connections?.udp || 0)
   };
@@ -1863,7 +1879,7 @@ function calculateCycleTraffic(meta, report = {}) {
   const stored = state.trafficCycles?.[meta.id];
   const cycleKey = trafficCycleKey(cycle);
 
-  if (stored && (frozen || stored.cycleKey === cycleKey)) {
+  if (stored && (frozen || stored.cycleKey === cycleKey || trafficCyclesOverlap(stored, cycle, report, meta))) {
     const usedIn = Math.max(0, Number(stored.usedIn || 0));
     const usedOut = Math.max(0, Number(stored.usedOut || 0));
     const usedTotal = usedIn + usedOut;
@@ -1879,53 +1895,128 @@ function calculateCycleTraffic(meta, report = {}) {
     };
   }
 
+  if (stored) return { startAt: cycle.startAt, endAt: cycle.endAt, unit: cycle.unit, quotaBytes,
+    usedIn: 0, usedOut: 0, usedTotal: 0, remainingBytes: quotaBytes > 0 ? quotaBytes : null };
   return calculateCycleTrafficFromHistory(meta, report, cycle, quotaBytes);
+}
+
+function trafficCounter(value) {
+  if (value == null || value === '' || typeof value === 'boolean') return null;
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+function trafficBootAt(report, at) {
+  const uptime = Number(report?.uptimeSeconds);
+  return uptime > 0 && Number.isFinite(uptime) && at > 0 ? at - uptime * 1000 : null;
+}
+
+function trafficRebooted(previous, report, now) {
+  if (previous.bootId && report.bootId) return previous.bootId !== report.bootId;
+  const before = previous.lastBootAt ?? trafficBootAt(previous, previous.lastReportAt || previous.updatedAt);
+  const after = trafficBootAt(report, now);
+  // Allow sampling/transport jitter. A counter decrease by itself is never
+  // sufficient evidence of a reboot (missing samples used to add GB twice).
+  const elapsed = now - Number(previous.updatedAt || previous.lastReportAt || 0);
+  return before != null && after != null && after > before + 60000
+    && Number(report.uptimeSeconds) * 1000 <= elapsed + 5000;
+}
+
+function trafficCyclesOverlap(previous, cycle, report = {}, meta = {}) {
+  if (!previous) return false;
+  const start = Number(previous.startAt || report.firstReportAt || meta.createdAt || previous.updatedAt || 0);
+  const end = previous.endAt == null ? Infinity : Number(previous.endAt);
+  const nextStart = Number(cycle.startAt || report.firstReportAt || meta.createdAt || 0);
+  const nextEnd = cycle.endAt == null ? Infinity : Number(cycle.endAt);
+  // Half-open ranges: touching at a reset boundary is not an overlap.
+  return Math.max(start, nextStart) < Math.min(end, nextEnd);
+}
+
+function reconcileTrafficCycle(meta, report = {}, now = Date.now()) {
+  const previous = state.trafficCycles?.[meta.id];
+  const cycle = currentTrafficCycle(meta, now);
+  const key = trafficCycleKey(cycle);
+  if (!previous || (previous.cycleKey === key && previous.endAt === cycle.endAt)) return;
+  const retain = trafficCyclesOverlap(previous, cycle, report, meta);
+  state.trafficCycles[meta.id] = { ...previous,
+    usedIn: retain ? previous.usedIn : 0, usedOut: retain ? previous.usedOut : 0,
+    cycleKey: key, startAt: cycle.startAt, endAt: cycle.endAt, unit: cycle.unit,
+    countBeforeStart: retain && now < cycle.startAt,
+    carryBaseline: retain,
+    accountingFrom: retain ? previous.accountingFrom : now
+  };
+}
+
+function isStaleTrafficReport(previous, report, now = Date.now()) {
+  if (!previous) return false;
+  if (report.bootId && previous.retiredBootIds?.includes(report.bootId)) return true;
+  const bootAt = trafficBootAt(report, now);
+  if ((!report.bootId || !previous.bootId) && bootAt != null && previous.lastBootAt != null
+      && bootAt < previous.lastBootAt - 60000) return true;
+  return Boolean(report.bootId && report.bootId === previous.bootId
+    && Number(report.uptimeSeconds) > 0 && Number(previous.uptimeSeconds) > Number(report.uptimeSeconds));
 }
 
 function updateTrafficCycleState(meta, previousReport = {}, report = {}, now = Date.now()) {
   if (!meta?.id) return;
   state.trafficCycles = state.trafficCycles || {};
-  const cycle = currentTrafficCycle(meta);
+  const cycle = currentTrafficCycle(meta, now);
   const cycleKey = trafficCycleKey(cycle);
-  const totalIn = Math.max(0, Number(report.net?.totalIn || 0));
-  const totalOut = Math.max(0, Number(report.net?.totalOut || 0));
   const previous = state.trafficCycles[meta.id];
-
-  if (!previous || previous.cycleKey !== cycleKey) {
-    const seed = calculateCycleTrafficFromHistory(meta, report, cycle, normalizeNullableNumber(meta.remainingTrafficBytes) || 0);
-    state.trafficCycles[meta.id] = {
-      cycleKey,
-      startAt: cycle.startAt || null,
-      endAt: cycle.endAt || null,
-      unit: cycle.unit,
-      usedIn: Math.max(0, Number(seed.usedIn || 0)),
-      usedOut: Math.max(0, Number(seed.usedOut || 0)),
-      lastTotalIn: totalIn,
-      lastTotalOut: totalOut,
-      updatedAt: now
-    };
-    return;
+  if (isStaleTrafficReport(previous, report, now)) return;
+  if (previous && now <= Number(previous.updatedAt || 0)) return;
+  const sameCycle = previous?.cycleKey === cycleKey && previous?.endAt === cycle.endAt;
+  const retain = sameCycle || trafficCyclesOverlap(previous, cycle, previousReport, meta);
+  const seed = retain ? previous : previous ? { usedIn: 0, usedOut: 0 } : calculateCycleTrafficFromHistory(meta, previousReport, cycle, 0);
+  const next = retain ? previous : {
+    usedIn: seed.usedIn, usedOut: seed.usedOut,
+    lastTotalIn: trafficCounter(previous?.lastTotalIn ?? previousReport.net?.totalIn),
+    lastTotalOut: trafficCounter(previous?.lastTotalOut ?? previousReport.net?.totalOut),
+    updatedAt: previousReport.lastReportAt || 0,
+    uptimeSeconds: previous?.uptimeSeconds ?? previousReport.uptimeSeconds, bootId: previous?.bootId || previousReport.bootId || '',
+    lastBootAt: previous?.lastBootAt, retiredBootIds: previous?.retiredBootIds || []
+  };
+  if (!sameCycle) next.countBeforeStart = Boolean(retain && now < cycle.startAt);
+  const bootReference = { ...previousReport, ...next, lastReportAt: next.updatedAt || previousReport.lastReportAt };
+  const rebooted = trafficRebooted(bootReference, report, now);
+  const observedBootAt = trafficBootAt(report, now);
+  const intervalInCycle = (!next.accountingFrom || Number(next.updatedAt || 0) >= next.accountingFrom)
+    && (next.carryBaseline || next.countBeforeStart || (!sameCycle && retain) || !cycle.startAt || Number(next.updatedAt || 0) >= cycle.startAt);
+  if (rebooted && next.bootId && report.bootId && next.bootId !== report.bootId) {
+    next.retiredBootIds = [...new Set([...(next.retiredBootIds || []), next.bootId])].slice(-16);
   }
-
-  const deltaIn = trafficCounterDelta(totalIn, previous.lastTotalIn);
-  const deltaOut = trafficCounterDelta(totalOut, previous.lastTotalOut);
-  previous.startAt = cycle.startAt || previous.startAt || null;
-  previous.endAt = cycle.endAt || previous.endAt || null;
-  previous.unit = cycle.unit;
-  previous.usedIn = Math.max(0, Number(previous.usedIn || 0)) + deltaIn;
-  previous.usedOut = Math.max(0, Number(previous.usedOut || 0)) + deltaOut;
-  previous.lastTotalIn = totalIn;
-  previous.lastTotalOut = totalOut;
-  previous.updatedAt = now;
-}
-
-function trafficCounterDelta(current, previous) {
-  const currentValue = Math.max(0, Number(current || 0));
-  const previousValue = Math.max(0, Number(previous || 0));
-  if (!Number.isFinite(currentValue)) return 0;
-  if (!Number.isFinite(previousValue)) return currentValue;
-  if (currentValue >= previousValue) return currentValue - previousValue;
-  return currentValue;
+  for (const [counter, used, last] of [['totalIn','usedIn','lastTotalIn'], ['totalOut','usedOut','lastTotalOut']]) {
+    const current = trafficCounter(report.net?.[counter]);
+    const baseline = trafficCounter(next[last]);
+    next[used] = Math.max(0, Number(next[used] || 0));
+    if (current == null) {
+      if (rebooted) next[last] = next.countBeforeStart || !cycle.startAt || observedBootAt >= cycle.startAt ? 0 : null;
+      else if (!intervalInCycle) next[last] = null;
+      continue;
+    }
+    if (cycle.startAt && now < cycle.startAt && !next.countBeforeStart) { next[last] = Math.max(baseline ?? 0, current); continue; }
+    if (rebooted) {
+      // Only the current boot's observed total is known after a real reboot.
+      // Never assign pre-boundary bytes to a new cycle after a long outage.
+      const bootAt = trafficBootAt(report, now);
+      if (next.countBeforeStart || !cycle.startAt || (bootAt != null && bootAt >= cycle.startAt)) next[used] += current;
+      next[last] = current;
+    } else if (baseline == null || !intervalInCycle) {
+      next[last] = current;
+    } else if (current >= baseline) {
+      next[used] += current - baseline;
+      next[last] = current;
+    }
+    // A lower counter in the same boot retains its high-water baseline. When
+    // a temporarily missing interface returns, its entire total is not added.
+  }
+  Object.assign(next, { version: 2, cycleKey, startAt: cycle.startAt || null,
+    endAt: cycle.endAt || null, unit: cycle.unit, updatedAt: now });
+  delete next.carryBaseline;
+  if (Number(report.uptimeSeconds) > 0) next.uptimeSeconds = report.uptimeSeconds;
+  if (observedBootAt != null) next.lastBootAt = observedBootAt;
+  if (report.bootId) next.bootId = report.bootId;
+  state.trafficCycles[meta.id] = next;
 }
 
 function trafficCycleKey(cycle) {
@@ -1933,41 +2024,22 @@ function trafficCycleKey(cycle) {
 }
 
 function calculateCycleTrafficFromHistory(meta, report = {}, cycle = currentTrafficCycle(meta), quotaBytes = normalizeNullableNumber(meta.remainingTrafficBytes) || 0) {
-  const totalIn = Number(report.net?.totalIn || 0);
-  const totalOut = Number(report.net?.totalOut || 0);
-  const history = state.history?.[meta.id] || [];
   const startAt = cycle.startAt || Number(meta.createdAt || report.firstReportAt || report.lastReportAt || 0) || 0;
-  let baseline = null;
-  let firstInCycle = null;
-  for (let index = history.length - 1; index >= 0; index -= 1) {
-    const point = history[index];
-    if (Number(point.t || 0) <= startAt && (point.totalIn != null || point.totalOut != null)) {
-      baseline = point;
-      break;
-    }
+  const history = [...(state.history?.[meta.id] || [])];
+  if (report.lastReportAt) history.push({ ...report.net, t: report.lastReportAt, uptimeSeconds: report.uptimeSeconds, bootId: report.bootId });
+  const points = [...new Map(history.filter(p => Number(p.t) >= startAt && (!cycle.endAt || Number(p.t) < cycle.endAt)).map(p => [Number(p.t),p])).values()].sort((a,b)=>a.t-b.t);
+  let usedIn = 0, usedOut = 0, previous = null, lastIn = null, lastOut = null;
+  for (const point of points) {
+    const rebooted = previous && trafficRebooted({ ...previous, lastReportAt: previous.t },point,point.t);
+    const incoming = trafficCounter(point.totalIn), outgoing = trafficCounter(point.totalOut);
+    if (rebooted) {lastIn=0;lastOut=0;}
+    if (incoming != null && (lastIn == null || incoming >= lastIn)) { if(lastIn!=null)usedIn+=incoming-lastIn;lastIn=incoming; }
+    if (outgoing != null && (lastOut == null || outgoing >= lastOut)) { if(lastOut!=null)usedOut+=outgoing-lastOut;lastOut=outgoing; }
+    previous=point;
   }
-  for (const point of history) {
-    if (Number(point.t || 0) >= startAt && (point.totalIn != null || point.totalOut != null)) {
-      firstInCycle = point;
-      break;
-    }
-  }
-  const base = baseline || firstInCycle;
-  const baselineIn = base ? Number(base.totalIn || 0) : totalIn;
-  const baselineOut = base ? Number(base.totalOut || 0) : totalOut;
-  const usedIn = Math.max(0, totalIn - baselineIn);
-  const usedOut = Math.max(0, totalOut - baselineOut);
   const usedTotal = usedIn + usedOut;
-  return {
-    startAt: startAt || null,
-    endAt: cycle.endAt,
-    unit: cycle.unit,
-    quotaBytes,
-    usedIn,
-    usedOut,
-    usedTotal,
-    remainingBytes: quotaBytes > 0 ? Math.max(0, quotaBytes - usedTotal) : null
-  };
+  return { startAt: startAt || null, endAt: cycle.endAt, unit: cycle.unit, quotaBytes, usedIn, usedOut, usedTotal,
+    remainingBytes: quotaBytes > 0 ? Math.max(0, quotaBytes - usedTotal) : null };
 }
 
 function isExpiredOffline(meta, report = {}) {
@@ -1982,22 +2054,28 @@ function currentTrafficCycle(meta, referenceAt = Date.now()) {
   const unit = normalizeTrafficCycleUnit(meta.trafficCycleUnit);
   const anchor = parseLocalDate(meta.trafficCycleStartDate);
   if (!anchor) return { unit, startAt: null, endAt: null };
-  let start = new Date(anchor.getTime());
-  let next = addTrafficCycle(start, unit);
-  const now = referenceAt;
-  while (next.getTime() <= now) {
+  let index = 0, start = anchor, next = addTrafficCycle(anchor, unit, 1);
+  while (next.getTime() <= referenceAt) {
     start = next;
-    next = addTrafficCycle(start, unit);
+    next = addTrafficCycle(anchor, unit, ++index + 1);
   }
   return { unit, startAt: start.getTime(), endAt: next.getTime() };
 }
 
-function addTrafficCycle(date, unit) {
-  const next = new Date(date.getTime());
-  if (unit === 'day') next.setDate(next.getDate() + 1);
-  else if (unit === 'week') next.setDate(next.getDate() + 7);
-  else if (unit === 'year') next.setFullYear(next.getFullYear() + 1);
-  else next.setMonth(next.getMonth() + 1);
+function addTrafficCycle(anchor, unit, count = 1) {
+  const next = new Date(anchor.getTime());
+  if (unit === 'day') next.setDate(next.getDate() + count);
+  else if (unit === 'week') next.setDate(next.getDate() + 7 * count);
+  else {
+    // Always calculate from the original billing day. Jan 31 -> Feb 28 ->
+    // Mar 31, rather than overflowing into March and permanently drifting.
+    const day = anchor.getDate();
+    next.setDate(1);
+    if (unit === 'year') next.setFullYear(anchor.getFullYear() + count);
+    else next.setMonth(anchor.getMonth() + count);
+    const lastDay = new Date(next.getFullYear(),next.getMonth()+1,0).getDate();
+    next.setDate(Math.min(day,lastDay));
+  }
   return next;
 }
 

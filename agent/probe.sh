@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-AGENT_PROBE_VERSION="20261105-shell-target-retry-v4"
+AGENT_PROBE_VERSION="20261112-shell-traffic-boot-v5"
 
 HUB_URL="${HUB_URL:-http://127.0.0.1:8080}"
 AGENT_TOKEN="${AGENT_TOKEN:-}"
@@ -374,6 +374,7 @@ build_payload() {
   printf '"hostname":"%s",' "$(json_escape "$hostname")"
   ip_meta_json; printf ','
   printf '"uptimeSeconds":%d,' "$uptime"
+  printf '"bootId":"%s",' "$(json_escape "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)")"
   os_json; printf ','
   cpu_json; printf ','
   memory_json; printf ','

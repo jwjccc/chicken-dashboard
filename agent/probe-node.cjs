@@ -11,7 +11,7 @@ const { execFileSync } = require('node:child_process');
 
 const { performance } = require('node:perf_hooks');
 const MAX_RESPONSE_BYTES = 1024 * 1024;
-const VERSION = '20261105-target-retry-v5';
+const VERSION = '20261112-traffic-boot-v6';
 const HUB_URL = process.env.HUB_URL || 'http://127.0.0.1:8080';
 const AGENT_TOKEN = process.env.AGENT_TOKEN || '';
 const SERVER_ID = process.env.SERVER_ID || os.hostname();
@@ -388,6 +388,7 @@ async function buildPayload() {
     hostname: os.hostname(),
     ...ipFields(),
     uptimeSeconds: uptimeSeconds(),
+    bootId: readFirstLine('/proc/sys/kernel/random/boot_id'),
     os: staticOs,
     cpu: { percent: readCpuPercent(), model: cpuModel, cores: cpuCores, load: readLoad() },
     memory: { total: mem.total, used: mem.used, percent: mem.percent },

@@ -43,6 +43,7 @@ async function createHub(t, initial = {}) {
     pruneConnectivityHistory,
     normalizeBackgrounds, normalizeHubUrl, isAgentEndpointRequest,
     buildAgentInstaller, buildAgentUninstaller, buildInstallCommand, buildUninstallCommand, agentIdentityKey, transactConfig,
+    reconcileTrafficCycle, trafficCyclesOverlap, isStaleTrafficReport,
     setRestart(fn) { performPanelRestart = fn; },
     async close() { testClosing = true; for (const timer of testIntervals) clearInterval(timer); await saveStateNow(); server.closeAllConnections(); if(agentServer) {agentServer.closeAllConnections(); await new Promise(resolve=>agentServer.close(resolve));} await new Promise(resolve => server.close(resolve)); connectivityDb.close(); }
   };`;
@@ -498,6 +499,11 @@ test('frontend rules: expiry, offline chart anchoring and local flags', async ()
   vm.runInContext(select('trafficQuotaUsage', 'barMetric') + select('networkQualityReferenceTime', 'networkQualityAxisStepMs') + select('networkQualityAxisStepMs', 'normalizedNetworkQualityHistory') + select('countryCode', 'escapeHtml'), context);
   const server = { online: false, startedAt: '2020-01-01', expiresAt: '2021-01-01', cycleTraffic: { quotaBytes: 1000, usedTotal: 100, remainingBytes: 900, endAt: Date.now() + 86400_000 } };
   assert.equal(context.trafficQuotaUsage(server).resetLabel, '');
+  const linked={...server,cycleTraffic:{quotaBytes:1000,usedIn:120,usedOut:80,usedTotal:999,remainingBytes:1}};
+  assert.equal(context.trafficQuotaUsage(linked).used,200);
+  assert.equal(context.trafficQuotaUsage(linked).remaining,800,'remaining and both cycle directions share one source');
+  assert.equal(context.trafficQuotaUsage({...linked,cycleTraffic:{quotaBytes:1000,usedIn:900,usedOut:200}}).remaining,0);
+  assert.equal(context.trafficQuotaUsage({...linked,cycleTraffic:{quotaBytes:2000,usedIn:120,usedOut:80}}).used,200,'quota edits never alter cycle usage');
   assert.ok(!context.trafficQuotaBar(context.trafficQuotaUsage(server)).includes('重置'));
   assert.ok(context.trafficQuotaUsage({ ...server, online: true }).resetLabel.includes('天后重置'));
   assert.ok(context.trafficQuotaUsage({ ...server, expiresAt: '2099-01-01' }).resetLabel.includes('天后重置'));
@@ -666,7 +672,8 @@ test('Linux shell fallback sends valid metrics without waiting for metadata', { 
   t.after(async () => { receiver.closeAllConnections(); receiver.close(); await rm(directory, { recursive: true, force: true }); });
   await promisify(execFile)('bash', [path.join(root, 'agent/probe.sh'), 'once'], { timeout: 10000, env: { ...process.env, HUB_URL: `http://127.0.0.1:${receiver.address().port}`, AGENT_TOKEN: 'test-secret', SERVER_ID: 'shell-test', STATE_DIR: directory } });
   assert.equal(received.id, 'shell-test');
-  assert.equal(received.probeVersion, '20261105-shell-target-retry-v4');
+  assert.equal(received.probeVersion, '20261112-shell-traffic-boot-v5');
+  assert.match(received.bootId, /^[a-f0-9-]{36}$/);
   assert.equal(typeof received.cpu.percent, 'number');
   assert.equal(typeof received.memory.total, 'number');
   assert.equal(typeof received.net.totalIn, 'number');
@@ -917,4 +924,183 @@ if [[ "$url" == */probe-node.cjs ]]; then printf 'setInterval(()=>{},1000);\\n' 
   await execute(uninstall);
   assert.equal(await exists(envPath(ipUnit)),false);assert.equal(await exists(envPath(domainUnit)),false);
   assert.equal(await readFile(envPath(foreign),'utf8'),foreignEnv);
+});
+
+test('cycle traffic resists missing/reset counters, survives restarts and uses anchored billing dates', async t => {
+  const hub=await createHub(t);
+  const {state,config}=hub;
+  const base=new Date(2026,10,12,12).getTime();
+  const meta={id:'cycle',name:'Cycle',trafficCycleStartDate:'2026-11-01',trafficCycleUnit:'month'};
+  config.servers=[meta];
+  let previous={}, tick=0;
+  const send=(net,extra={})=>{
+    const now=base+tick++*2000;
+    const report=hub.normalizeAgentReport({id:meta.id,net,uptimeSeconds:100000+tick*2,...extra});
+    hub.updateTrafficCycleState(meta,previous,report,now);
+    previous={...hub.mergeAgentReport(previous,report),lastReportAt:now};
+    state.servers[meta.id]=previous;
+    return state.trafficCycles[meta.id];
+  };
+  assert.equal(send({totalIn:10000,totalOut:20000}).usedIn,0,'first report establishes baseline');
+  assert.equal(send({totalIn:11000,totalOut:22000}).usedIn,1000);
+  assert.equal(send({totalIn:0,totalOut:0}).usedIn,1000,'same boot zero is not a reboot');
+  assert.equal(send({totalIn:12000,totalOut:24000}).usedIn,2000,'recovery adds only the real delta');
+  assert.equal(send({}).lastTotalIn,12000,'missing counters retain baseline');
+  assert.equal(previous.net.totalIn,12000,'display retains last valid counters');
+  assert.equal(send({totalIn:null,totalOut:'invalid'}).usedIn,2000);
+  assert.equal(send({totalIn:13000,totalOut:26000}).usedIn,3000);
+  assert.equal(send({totalIn:7000,totalOut:8000}).usedIn,3000,'old/lower counters do not inflate usage');
+  assert.equal(send({totalIn:14000,totalOut:28000}).usedIn,4000);
+  assert.equal(send({totalIn:14000,totalOut:28000}).usedIn,4000,'duplicate samples add nothing');
+  const reboot=send({totalIn:100,totalOut:200},{uptimeSeconds:5,bootId:'new-boot'});
+  assert.equal(reboot.usedIn,4100);assert.equal(reboot.usedOut,8200);
+  assert.equal(send({totalIn:200,totalOut:400},{uptimeSeconds:7,bootId:'new-boot'}).usedIn,4200);
+  state.trafficCycles=JSON.parse(JSON.stringify(state.trafficCycles));
+  assert.equal(send({totalIn:300,totalOut:600},{uptimeSeconds:9,bootId:'new-boot'}).usedIn,4300,'persistent baseline survives panel restart');
+  assert.equal(send({totalIn:500,totalOut:700},{uptimeSeconds:10,bootId:'newer-boot'}).usedIn,4800,'boot ID catches reboot even when counter rises');
+  const before=state.trafficCycles[meta.id].usedIn;
+  meta.trafficCycleStartDate='2026-10-20';
+  assert.equal(send({totalIn:600,totalOut:800},{uptimeSeconds:12,bootId:'newer-boot'}).usedIn,before+100,'earlier anchor preserves durable usage');
+  const cases=[['2026-01-31','month',new Date(2026,1,28,12),'2026-02-28','2026-03-31'],['2026-01-31','month',new Date(2026,3,30,12),'2026-04-30','2026-05-31'],['2024-02-29','year',new Date(2028,1,29,12),'2028-02-29','2029-02-28']];
+  const local=d=>`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  for(const [date,unit,at,start,end] of cases){const cycle=hub.currentTrafficCycle({trafficCycleStartDate:date,trafficCycleUnit:unit},at.getTime());assert.equal(local(new Date(cycle.startAt)),start);assert.equal(local(new Date(cycle.endAt)),end);}
+  const day={id:'boundary',trafficCycleStartDate:'2026-11-01',trafficCycleUnit:'day'};
+  const midnight=new Date(2026,10,13).getTime();
+  const r1={net:{totalIn:1000,totalOut:2000},uptimeSeconds:10000,lastReportAt:midnight-2000};
+  hub.updateTrafficCycleState(day,{},r1,midnight-2000);
+  const r2={net:{totalIn:2000,totalOut:4000},uptimeSeconds:20000,lastReportAt:midnight+10000000};
+  hub.updateTrafficCycleState(day,r1,r2,r2.lastReportAt);
+  assert.equal(state.trafficCycles.boundary.usedIn,0,'long offline delta across boundary is not assigned to new cycle');
+  hub.updateTrafficCycleState(day,r2,{net:{totalIn:2100,totalOut:4200},uptimeSeconds:20002},r2.lastReportAt+2000);
+  assert.equal(state.trafficCycles.boundary.usedIn,100);
+  const nextMidnight=midnight+86400000;
+  hub.updateTrafficCycleState(day,r2,{net:{},uptimeSeconds:96400},nextMidnight);
+  hub.updateTrafficCycleState(day,{}, {net:{totalIn:9000,totalOut:18000},uptimeSeconds:96402},nextMidnight+2000);
+  assert.equal(state.trafficCycles.boundary.usedIn,0,'missing first sample cannot carry old cycle counters across the boundary');
+  hub.updateTrafficCycleState(day,{}, {net:{totalIn:9100,totalOut:18200},uptimeSeconds:96404},nextMidnight+4000);
+  assert.equal(state.trafficCycles.boundary.usedIn,100);
+  const old=hub.normalizeAgentReport({id:'cycle',net:{totalIn:-2,totalOut:Infinity}});
+  assert.equal(Object.hasOwn(old.net,'totalIn'),false);assert.equal(Object.hasOwn(old.net,'totalOut'),false);
+  meta.remainingTrafficBytes=100000;
+  const measured=hub.calculateCycleTraffic(meta,previous);
+  assert.equal(measured.remainingBytes,100000-measured.usedIn-measured.usedOut);
+  meta.remainingTrafficBytes=200000;
+  const changed=hub.calculateCycleTraffic(meta,previous);
+  assert.equal(changed.usedTotal,measured.usedTotal);
+  assert.equal(changed.remainingBytes,measured.remainingBytes+100000);
+});
+
+test('editing unrelated server settings preserves exact quota bytes and explicit clear',async()=>{
+  const source=await readFile(path.join(root,'public/app.js'),'utf8');
+  const c=vm.createContext({Number,Math});
+  vm.runInContext(source.slice(source.indexOf('function remainingTrafficInput('),source.indexOf('async function copyInstallCommand(')),c);
+  for(const bytes of [0,563714457600,1234567890123]) {
+    const formatted=c.remainingTrafficInput(bytes);
+    const input={value:String(formatted.value),dataset:{originalBytes:String(bytes),originalValue:String(formatted.value),originalUnit:formatted.unit}};
+    assert.equal(c.trafficQuotaInputBytes(input,formatted.unit),bytes);
+    input.value='';assert.equal(c.trafficQuotaInputBytes(input,formatted.unit),null);
+  }
+});
+
+test('overlapping billing changes retain one total and reset only at the new end', async t => {
+  const hub=await createHub(t), {state,testHooks}=hub;
+  const date=(m,d,h=0)=>new Date(2026,m-1,d,h).getTime();
+  const meta={id:'overlap',trafficCycleStartDate:'2026-01-01',trafficCycleUnit:'month'};
+  let previous={}, total=10000;
+  const bootAt=date(1,1);
+  const send=(at,delta=100)=>{
+    total+=delta;
+    const report={net:{totalIn:total,totalOut:total*2},uptimeSeconds:(at-bootAt)/1000,bootId:'fixed',lastReportAt:at,firstReportAt:date(1,2)};
+    hub.updateTrafficCycleState(meta,previous,report,at);previous=report;state.servers[meta.id]=report;
+    return state.trafficCycles[meta.id];
+  };
+  send(date(1,2));assert.equal(send(date(1,20)).usedIn,100);
+  meta.trafficCycleStartDate='2026-01-15';
+  testHooks.reconcileTrafficCycle(meta,previous,date(1,20));
+  assert.equal(state.trafficCycles.overlap.usedIn,100);
+  assert.equal(state.trafficCycles.overlap.endAt,date(2,15));
+  assert.equal(send(date(2,1)).usedIn,200,'old reset date must no longer reset');
+  assert.equal(send(date(2,14,23)).usedIn,300);
+  assert.equal(send(date(2,15)).usedIn,0,'adjacent periods do not overlap');
+  assert.equal(send(date(2,15,1)).usedIn,100);
+  meta.trafficCycleStartDate='2026-02-20';
+  testHooks.reconcileTrafficCycle(meta,previous,date(2,15,1));
+  assert.equal(send(date(2,16)).usedIn,200,'future overlapping start continues existing accounting');
+  assert.equal(send(date(3,19)).usedIn,300);
+  assert.equal(send(date(3,20)).usedIn,0,'resets at new March 20 end');
+  send(date(3,20,1));
+  meta.trafficCycleStartDate='2026-05-01';
+  testHooks.reconcileTrafficCycle(meta,previous,date(3,20,1));
+  assert.equal(state.trafficCycles.overlap.usedIn,0,'disjoint change clears immediately');
+  assert.equal(send(date(4,25)).usedIn,0);
+  assert.equal(send(date(5,1)).usedIn,0,'pre-start interval is not charged');
+  assert.equal(send(date(5,1,1)).usedIn,100);
+  meta.trafficCycleStartDate='2026-05-15';
+  testHooks.reconcileTrafficCycle(meta,previous,date(5,1,1));
+  meta.trafficCycleStartDate='2026-06-01';
+  testHooks.reconcileTrafficCycle(meta,previous,date(5,1,1));
+  assert.equal(state.trafficCycles.overlap.usedIn,100,'repeated changes compare against last saved range even without reports');
+  assert.equal(state.trafficCycles.overlap.endAt,date(7,1));
+  assert.equal(send(date(6,30)).usedIn,200);
+  assert.equal(send(date(7,1)).usedIn,0);
+  assert.equal(testHooks.trafficCyclesOverlap({startAt:10,endAt:20},{startAt:20,endAt:30}),false);
+  assert.equal(testHooks.trafficCyclesOverlap({startAt:10,endAt:20},{startAt:15,endAt:25}),true);
+});
+
+test('late old boots and missing reboot samples never add a full baseline twice',async t=>{
+  const hub=await createHub(t), {state}=hub, meta={id:'ordered'};
+  const base=Date.now();let previous={};
+  const send=(offset,bootId,uptimeSeconds,totalIn,totalOut)=>{
+    const report={bootId,uptimeSeconds,net:{totalIn,totalOut},lastReportAt:base+offset};
+    hub.updateTrafficCycleState(meta,previous,report,base+offset);previous=report;
+    return structuredClone(state.trafficCycles.ordered);
+  };
+  send(0,'a',10000,100000,200000);
+  assert.equal(send(2000,'a',10002,100100,200200).usedIn,100);
+  const reset=send(4000,'b',1,undefined,undefined);
+  assert.equal(reset.usedIn,100);
+  assert.equal(send(6000,'b',3,50,100).usedIn,150,'first valid new boot total is retained');
+  const before=structuredClone(state.trafficCycles.ordered);
+  send(8000,'a',10008,100200,200400);
+  assert.deepEqual(state.trafficCycles.ordered,before,'retired boot cannot restore old high counters');
+  assert.equal(send(10000,'b',7,60,120).usedIn,160);
+  send(12000,'b',6,55,110);
+  assert.equal(state.trafficCycles.ordered.usedIn,160,'out of order same-boot sample ignored');
+  const saved=JSON.parse(JSON.stringify(state.trafficCycles));state.trafficCycles=saved;
+  send(14000,'a',10014,100300,200600);
+  assert.equal(state.trafficCycles.ordered.usedIn,160,'retired boot protection survives persistence');
+  assert.equal(send(16000,'b',13,70,140).usedIn,170);
+  // Legacy agent delayed delivery must not be mistaken for a reboot.
+  previous={};delete state.trafficCycles.ordered;
+  send(0,'',10000,100000,200000);
+  assert.equal(send(120000,'',10002,100100,200200).usedIn,100);
+});
+
+test('admin cycle edits persist offline totals immediately and stale HTTP reports cannot overwrite them',async t=>{
+  const hub=await createHub(t), now=Date.now();
+  const local=d=>`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  const old=new Date(now);old.setDate(old.getDate()-10);
+  const shifted=new Date(now);shifted.setDate(shifted.getDate()-5);
+  const meta={id:'saved-cycle',name:'Saved',secret:'saved-token',createdAt:old.getTime(),startedAt:'2020-01-01',expiresAt:'2099-01-01',trafficCycleStartDate:local(old),trafficCycleUnit:'month'};
+  hub.config.servers.push(meta);
+  const r1={id:meta.id,bootId:'a',uptimeSeconds:10000,net:{totalIn:1000,totalOut:2000},lastReportAt:now-200000};
+  const r2={...r1,uptimeSeconds:10002,net:{totalIn:1100,totalOut:2200},lastReportAt:now-198000};
+  hub.updateTrafficCycleState(meta,{},r1,r1.lastReportAt);hub.updateTrafficCycleState(meta,r1,r2,r2.lastReportAt);hub.state.servers[meta.id]=r2;
+  const login=await realFetch(hub.base+'/api/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:'admin',password:'admin'})});
+  const cookie=login.headers.get('set-cookie').split(';')[0],{csrfToken}=await login.json();
+  const headers={'Content-Type':'application/json',Cookie:cookie,'X-CSRF-Token':csrfToken};
+  const save=async date=>{const r=await realFetch(hub.base+'/api/admin/server',{method:'POST',headers,body:JSON.stringify({id:meta.id,startedAt:meta.startedAt,expiresAt:meta.expiresAt,trafficCycleStartDate:date})});assert.equal(r.status,200);};
+  await save(local(shifted));
+  const disk=JSON.parse(await readFile(path.join(hub.directory,'data/state.json'),'utf8')).trafficCycles[meta.id];
+  assert.equal(disk.usedIn,100);assert.equal(disk.usedOut,200);
+  assert.equal(disk.startAt,new Date(local(shifted)+'T00:00:00').getTime());
+  const report=async payload=>{hub.testHooks.resetReportRate(meta.id);const r=await realFetch(hub.base+'/api/agent/report',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer saved-token'},body:JSON.stringify({id:meta.id,...payload})});assert.equal(r.status,200);return r.json();};
+  await report({bootId:'b',uptimeSeconds:1,net:{totalIn:10,totalOut:20}});
+  const before=structuredClone(hub.state.trafficCycles[meta.id]);
+  assert.equal((await report({bootId:'a',uptimeSeconds:10200,net:{totalIn:5000,totalOut:6000}})).ignored,'stale_report');
+  assert.deepEqual(hub.state.trafficCycles[meta.id],before);assert.equal(hub.state.servers[meta.id].net.totalIn,10);
+  const future=new Date(now);future.setMonth(future.getMonth()+3);
+  await save(local(future));
+  const cleared=JSON.parse(await readFile(path.join(hub.directory,'data/state.json'),'utf8')).trafficCycles[meta.id];
+  assert.equal(cleared.usedIn,0);assert.equal(cleared.usedOut,0);
 });
